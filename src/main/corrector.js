@@ -7,13 +7,14 @@
  * + générateurs : fiches de révision (flashcards) et exercices d'entraînement.
  */
 const { AIError } = require('./providers');
+const { estimateTokens: est, limitsFromError, isSizeError } = require('./limits');
 
 const DEFAULTS = {
   provider: 'groq',
   correctionModel: 'auto',
   visionModel: 'auto',
   audioModel: 'auto',
-  maxInputChars: 60000,
+  maxInputChars: 400000,
   gradeMax: 20,
   level: 'BUT Informatique — 1re année',
   severity: 'normale',
@@ -262,8 +263,9 @@ async function readImage(ctx, j) {
       const r = await ctx.ai.chat({
         model: ctx.models.vision,
         temperature: 0,
-        maxTokens: 4096,
+        maxTokens: Math.min(4096, limitsFor(ctx, ctx.models.vision).maxOut),
         signal: ctx.signal,
+        onWait: (ms) => ctx.progress({ step: 'vision', message: `Pause de ${Math.ceil(ms / 1000)} s (limite de jetons par minute)…` }),
         messages: [{ role: 'user', content: [{ type: 'text', text: VISION_PROMPT + `\n(Fichier : ${j.part.label})` }, { type: 'image', mime: j.part.mime || 'image/jpeg', base64: j.part.base64 }] }]
       });
       if (r.content.trim()) return { text: r.content.trim(), via: ctx.models.vision };
@@ -317,32 +319,91 @@ async function buildSources(files, ctx) {
     .filter((x) => x.text && x.text.trim());
 }
 
-/** Appel au modèle principal avec bascule automatique sur les modèles de secours. */
-async function chatWithFallback(ctx, { system, user, json = true, maxTokens = 8192, step = 'correction', label = 'Correction' }) {
+// ================================================================ Appels au modèle (budget de jetons)
+
+/** Limites du modèle (fenêtre de contexte, sortie max, jetons/minute) connues pour ce compte. */
+function limitsFor(ctx, model) {
+  return ctx.limits ? ctx.limits(model) : { context: 32768, maxOut: 8192, tpm: Infinity };
+}
+
+/** Budget d'un appel : jetons d'entrée disponibles et sortie réservée, selon les limites du modèle. */
+function budgetFor(ctx, model, system, wantOut) {
+  const l = limitsFor(ctx, model);
+  const cap = Math.min(l.context, Number.isFinite(l.tpm) ? Math.floor(l.tpm * 0.9) : Infinity);
+  const out = Math.max(512, Math.min(wantOut, l.maxOut, Math.floor(cap * 0.5)));
+  const input = Math.max(400, Math.floor(cap - out - est(system) - 150));
+  return { out, input, cap };
+}
+
+class TooLarge extends AIError {
+  constructor(message) {
+    super(message || 'Requête trop volumineuse pour ce modèle.', 413, 'too_large');
+  }
+}
+
+/**
+ * Appel au modèle principal avec :
+ *  - sortie limitée au maximum autorisé par le modèle (appris automatiquement) ;
+ *  - attente automatique quand le quota de jetons par minute est atteint ;
+ *  - bascule sur les modèles de secours en cas de modèle indisponible ;
+ *  - signal « trop gros » (TooLarge) si sizeSensitive : l'appelant découpe alors le travail.
+ */
+async function chatWithFallback(ctx, { system, user, json = true, wantOut = 6000, step = 'correction', label = 'Correction', sizeSensitive = false, effort }) {
   const models = [ctx.models.main, ...(ctx.models.fallbacks || [])].filter(Boolean);
   let lastErr;
-  for (const model of models) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      ctx.progress({ step, message: `${label} en cours avec ${model}${attempt ? ' (nouvel essai)' : ''}…` });
+  for (const [mi, model] of models.entries()) {
+    let boost = 1;
+    let parseFails = 0;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const b = budgetFor(ctx, model, system, wantOut * boost);
+      if (est(user) > b.input) {
+        // Le modèle principal est trop petit pour cette requête : on découpe plutôt que de dégrader
+        if (sizeSensitive && mi === 0) throw new TooLarge(`Entrée estimée à ${est(user)} jetons pour ${b.input} disponibles.`);
+        if (sizeSensitive) break;
+      }
+      ctx.progress({ step, message: `${label} avec ${model}${attempt ? ' (nouvel essai)' : ''}…` });
       try {
-        const r = await ctx.ai.chat({ model, system, messages: [{ role: 'user', content: user }], json, maxTokens: attempt ? maxTokens * 2 : maxTokens, effort: ctx.s.reasoningEffort, signal: ctx.signal });
-        if (r.finishReason === 'length' && attempt === 0) continue;
+        const r = await ctx.ai.chat({
+          model, system, messages: [{ role: 'user', content: user }], json, maxTokens: b.out,
+          effort: effort || ctx.s.reasoningEffort, signal: ctx.signal,
+          onWait: (ms) => ctx.progress({ step, message: `Pause de ${Math.ceil(ms / 1000)} s (limite de jetons par minute de ton offre)…` })
+        });
+        if (r.finishReason === 'length') {
+          if (b.out < limitsFor(ctx, model).maxOut && boost < 4) { boost *= 2; continue; }
+          if (json) {
+            try {
+              return { parsed: parseJsonLoose(r.content), model: r.model || model };
+            } catch {
+              if (sizeSensitive) throw new TooLarge('La réponse attendue dépasse la sortie maximale du modèle.');
+              break;
+            }
+          }
+        }
         const parsed = json ? parseJsonLoose(r.content) : r.content;
-        if (model !== ctx.models.main) ctx.notes.push(`Le modèle principal n'a pas pu être utilisé ; ${label.toLowerCase()} réalisée avec ${model}.`);
+        if (mi > 0) ctx.notes.push(`Le modèle principal n'a pas pu être utilisé ; ${label.toLowerCase()} réalisée avec ${model}.`);
         return { parsed, model: r.model || model };
       } catch (err) {
         lastErr = err;
-        if (err.code === 'aborted' || err.status === 401) throw err;
-        if (err instanceof AIError && !err.canFallback && err.status !== 400 && err.status !== 422) throw err;
-        if (err instanceof AIError) break; // modèle suivant
+        if (err instanceof TooLarge || err.code === 'aborted' || err.status === 401) throw err;
+        if (err instanceof AIError) {
+          if (limitsFromError(err.message).maxOut) continue; // sortie max apprise : même modèle, sortie réduite
+          if (isSizeError(err)) {
+            // Les limites réelles viennent d'être apprises (message d'erreur / en-têtes) : on recalcule le budget
+            const nb = budgetFor(ctx, model, system, wantOut * boost);
+            if (est(user) > nb.input && sizeSensitive && mi === 0) throw new TooLarge(err.message);
+            if (nb.out < b.out && est(user) <= nb.input && attempt < 3) continue; // même modèle, sortie réduite
+            break; // limite inconnue ou modèle trop petit : modèle suivant
+          }
+          if (!err.canFallback && err.status !== 400 && err.status !== 422) throw err;
+          break; // modèle suivant
+        }
         // JSON invalide : nouvel essai, puis modèle suivant
+        if (++parseFails >= 2) break;
       }
     }
   }
-  const hint = lastErr && /tokens|too large|413|context/i.test(`${lastErr.message} ${lastErr.code}`)
-    ? ' Les documents sont trop volumineux pour les limites de ton offre : réduis le nombre de fichiers ou la limite de caractères dans les Paramètres.'
-    : '';
-  throw new Error(`${label} impossible : ${lastErr?.message || 'erreur inconnue'}.${hint}`);
+  if (lastErr && isSizeError(lastErr) && sizeSensitive) throw new TooLarge(lastErr.message);
+  throw new Error(`${label} impossible : ${lastErr?.message || 'erreur inconnue'}.`);
 }
 
 const CODE_LANGS = /```(python|py|javascript|js|sql|java|c|cpp|c\+\+|php|typescript|ts|plsql|mysql)\b/i;
@@ -351,19 +412,19 @@ function hasRunnableCode(sources) {
   return sources.some((s) => CODE_LANGS.test(s.text) || /\b(def |public class |#include|SELECT .+ FROM|CREATE TABLE|function\s*\w*\s*\(|console\.log|System\.out)/i.test(s.text));
 }
 
-/** Demande à l'IA un plan de tests, puis exécute réellement le code de l'étudiant. */
-async function verifyByExecution(ctx, sources, consigne, runCode) {
-  if (!ctx.s.executeCode || !runCode || !hasRunnableCode(sources)) return [];
-  const { sources: fitted } = fitSources(sources, Math.min(ctx.s.maxInputChars, 30000));
-  const system = `Tu prépares des tests d'exécution pour vérifier le code écrit par un étudiant en informatique.
+const TESTS_SYSTEM = `Tu prépares des tests d'exécution pour vérifier le code écrit par un étudiant en informatique.
 Langages exécutables : python, javascript, sql (SQLite), java (fichier unique avec main), c, cpp, php.
 Pour chaque réponse de code de l'ÉTUDIANT (pas l'énoncé), écris un programme COMPLET et AUTONOME qui reprend son code TEL QUEL (sans corriger ses erreurs) et ajoute des appels de test qui AFFICHENT les résultats (cas normaux et cas limites demandés par l'énoncé).
 Pour le SQL : crée d'abord les tables et insère un petit jeu de données cohérent avec l'énoncé (en SQLite), puis exécute les requêtes de l'étudiant telles quelles. Adapte uniquement la syntaxe spécifique à un SGBD (ex. Oracle) si c'est indispensable pour SQLite.
-Indique la sortie attendue si le code était correct. Au maximum 5 tests, les plus révélateurs. Si rien n'est exécutable, renvoie une liste vide.
+Indique la sortie attendue si le code était correct. Au maximum 4 tests, les plus révélateurs. Si rien n'est exécutable, renvoie une liste vide.
 Réponds UNIQUEMENT en JSON : {"executions":[{"but":"ce que le test vérifie","langage":"python|javascript|sql|java|c|cpp|php","code":"programme complet","entree":"texte envoyé sur l'entrée standard (souvent vide)","sortie_attendue":"…"}]}`;
+
+/** Demande à l'IA un plan de tests pour un bloc de documents, puis exécute réellement le code de l'étudiant. */
+async function verifyByExecution(ctx, docsText, consigne, runCode, { sizeSensitive = false } = {}) {
+  if (!ctx.s.executeCode || !runCode || !hasRunnableCode([{ text: docsText }])) return [];
   try {
-    const { parsed } = await chatWithFallback(ctx, { system, user: `${consigne ? `Indications : ${consigne}\n\n` : ''}${documentsBlock(fitted)}`, maxTokens: 6000, step: 'tests', label: 'Préparation des tests' });
-    const plan = arr(parsed.executions).filter((e) => e && e.code).slice(0, 5);
+    const { parsed } = await chatWithFallback(ctx, { system: TESTS_SYSTEM, user: `${consigne ? `Indications : ${consigne}\n\n` : ''}${docsText}`, wantOut: 3500, step: 'tests', label: 'Préparation des tests', sizeSensitive, effort: 'low' });
+    const plan = arr(parsed.executions).filter((e) => e && e.code).slice(0, 4);
     const out = [];
     for (const [i, e] of plan.entries()) {
       ctx.progress({ step: 'tests', message: `Exécution du test ${i + 1}/${plan.length} (${e.langage})…` });
@@ -372,33 +433,330 @@ Réponds UNIQUEMENT en JSON : {"executions":[{"but":"ce que le test vérifie","l
     }
     return out;
   } catch (err) {
+    if (err instanceof TooLarge) throw err;
     if (err.code === 'aborted' || err.status === 401) throw err;
     ctx.notes.push(`Vérification par exécution impossible : ${err.message}`);
     return [];
   }
 }
 
-async function runCorrection(ctx, sources, consigne, executions = []) {
+// ================================================================ Correction en un seul appel
+
+async function correctSingle(ctx, sources, consigne, runCode) {
   const { sources: fitted, truncated } = fitSources(sources, ctx.s.maxInputChars);
-  if (truncated) ctx.notes.push(`Les documents dépassent ${ctx.s.maxInputChars.toLocaleString('fr-FR')} caractères : certaines parties ont été tronquées (réglable dans les Paramètres).`);
-  const user = `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}Voici les ${fitted.length} document(s) fournis. Identifie l'énoncé, les réponses et l'éventuel barème, puis corrige.\n\n${documentsBlock(fitted)}${executionsBlock(executions)}\n\nRéponds uniquement avec l'objet JSON demandé.`;
-  const { parsed, model } = await chatWithFallback(ctx, { system: buildSystemPrompt(ctx.s), user });
+  const docs = documentsBlock(fitted);
+  const system = buildSystemPrompt(ctx.s);
+  const user = (ex) => `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}Voici les ${fitted.length} document(s) fournis. Identifie l'énoncé, les réponses et l'éventuel barème, puis corrige.\n\n${docs}${executionsBlock(ex)}\n\nRéponds uniquement avec l'objet JSON demandé.`;
+  // Vérification préalable : si tout ne tient pas dans un appel, on passe directement au mode découpé
+  if (est(user([])) > budgetFor(ctx, ctx.models.main, system, 6000).input) throw new TooLarge();
+  const executions = await verifyByExecution(ctx, docs, consigne, runCode, { sizeSensitive: true });
+  const { parsed, model } = await chatWithFallback(ctx, { system, user: user(executions), sizeSensitive: true });
+  if (truncated) ctx.notes.push(`Les documents dépassent ${ctx.s.maxInputChars.toLocaleString('fr-FR')} caractères : la fin a été tronquée (réglable dans les Réglages).`);
   const result = normalizeResult(parsed, ctx.s.gradeMax);
   result.executions = executions;
-  return { result, model };
+  return { result, model, mode: 'single' };
+}
+
+// ================================================================ Correction découpée (gros devoirs, petites limites)
+//  1. INDEXATION : chaque document est lu morceau par morceau (un appel à la fois) ; l'IA renvoie seulement
+//     des plages de lignes (énoncé / réponse / barème + numéro de question) — le texte reste intact localement.
+//  2. REGROUPEMENT : énoncé, barème et réponse de chaque question sont réunis.
+//  3. CORRECTION PAR LOTS : chaque lot de questions est corrigé par un appel indépendant (sous-tâche) qui tient
+//     dans les limites du modèle, avec exécution du code du lot.
+//  4. SYNTHÈSE : un dernier appel, très court, produit l'appréciation globale ; la note est recalculée localement.
+
+const INDEX_SYSTEM = `Tu prépares la correction d'un devoir d'informatique. On te donne un extrait d'un document dont chaque ligne est numérotée (L1, L2…).
+Découpe-le en segments consécutifs et indique pour chacun :
+- "nature" : "enonce" (sujet, consignes, questions, données fournies), "reponse" (ce que l'étudiant a écrit), "bareme" (barème ou corrigé du professeur) ou "autre" (en-tête, pagination, sans intérêt) ;
+- "question" : le numéro de la question concernée, au format court cohérent avec l'énoncé (ex. "1", "2.b", "3.1") ; "general" pour un contexte commun à plusieurs questions (présentation, données, schéma de tables, consignes générales).
+Réutilise exactement les numéros déjà rencontrés quand il s'agit des mêmes questions. Couvre toutes les lignes, sans chevauchement.
+Réponds UNIQUEMENT en JSON : {"segments":[{"de":1,"a":12,"nature":"enonce","question":"general"}]}`;
+
+function buildPartialPrompt(s) {
+  return `Tu es un correcteur expert et bienveillant pour des étudiants en ${s.level} (France), spécialiste de tout le programme du BUT Informatique.
+Tu corriges UNE PARTIE d'un devoir : uniquement les questions fournies ci-dessous (le reste est corrigé séparément).
+Pour chaque question : vérifie l'exactitude (calculs refaits, code exécuté mentalement, requêtes SQL, schémas), la méthode et la rédaction. Appuie-toi en priorité sur les RÉSULTATS D'EXÉCUTION RÉELLE s'ils sont fournis.
+Attribue des points : applique STRICTEMENT le barème du professeur s'il est fourni, sinon celui de l'énoncé, sinon un barème cohérent. Sévérité : ${s.severity}. Ne sanctionne pas une erreur évidente de transcription (OCR).
+Tout en français, tutoiement, Markdown, maths en LaTeX $…$, code dans des blocs \`\`\`.
+Réponds UNIQUEMENT en JSON :
+{"questions":[{"numero":"1.a","intitule":"…","statut":"correct | partiel | incorrect | non_traite","points_obtenus":0,"points_max":0,"commentaire":"…"}],
+ "fautes":[{"question":"1.a","gravite":"mineure | moyenne | majeure","categorie":"calcul | raisonnement | syntaxe | logique | modelisation | conception | methode | redaction | notation | performance | securite | bonnes_pratiques | hors_sujet | autre","notion":"…","description":"…","extrait":"extrait exact fautif","correction":"…"}],
+ "points_forts":["…"],
+ "ameliorations":[{"titre":"…","detail":"…"}],
+ "a_revoir":[{"notion":"…","priorite":"haute | moyenne | basse","pourquoi":"…","ressources":"…"}],
+ "correction_modele":"correction rédigée en Markdown des questions de ce lot"}`;
+}
+
+const SYNTH_SYSTEM = `Tu rédiges la synthèse finale d'une correction de devoir d'informatique (BUT Informatique), à partir des résultats déjà établis question par question.
+Ne modifie pas les points. Consolide les conseils (sans doublons) et rédige en français, en tutoyant.
+Réponds UNIQUEMENT en JSON :
+{"titre":"titre court et précis du devoir","matiere":"matière / ressource","type_exercice":"${EXERCISE_TYPES.join(' | ')}","langage":"langage ou outil principal ou \\"\\"",
+ "appreciation":"une phrase","resume":"3 à 6 phrases","points_forts":["…"],
+ "ameliorations":[{"titre":"…","detail":"…"}],"a_revoir":[{"notion":"…","priorite":"haute | moyenne | basse","pourquoi":"…","ressources":"…"}],
+ "remarques_identification":"comment l'énoncé, les réponses et le barème ont été repérés","mots_cles":["5 à 12 mots-clés"]}`;
+
+function normQ(q) {
+  let s = String(q ?? '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+  if (!s || /^(general|commun|contexte|global|intro|presentation|tout|toutes|all)/.test(s)) return 'general';
+  s = s.replace(/\b(exercice|exo|ex|question|questions|partie|part|q)\b\.?/g, ' ').replace(/[()\-–:/\\]+/g, ' ').trim().replace(/\s+/g, '.').replace(/\.+/g, '.').replace(/^\.|\.$/g, '');
+  return s || 'general';
+}
+
+/** Découpe un texte en morceaux d'au plus maxTokens (par lignes ; les lignes trop longues sont coupées). */
+function splitIntoChunks(text, maxTokens) {
+  const maxChars = Math.max(400, Math.floor(maxTokens * 3.2));
+  const lines = [];
+  for (const l of String(text).split('\n')) {
+    if (l.length <= 600) lines.push(l);
+    else for (let i = 0; i < l.length; i += 600) lines.push(l.slice(i, i + 600));
+  }
+  const chunks = [];
+  let cur = [];
+  let size = 0;
+  for (const l of lines) {
+    const add = l.length + 8;
+    if (cur.length && size + add > maxChars) {
+      chunks.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(l);
+    size += add;
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+const sliceText = (text, maxTokens) => (est(text) <= maxTokens ? text : `${text.slice(0, Math.floor(maxTokens * 3.2))}\n[… suite tronquée pour tenir dans les limites du modèle …]`);
+
+async function indexDocuments(ctx, sources) {
+  const units = new Map(); // clé -> { label, enonce: [], reponse: [], bareme: [] }
+  const general = { enonce: [], reponse: [], bareme: [] };
+  const seen = { enonce: new Set(), reponse: new Set(), bareme: new Set() };
+  const known = [];
+  const indexBudget = budgetFor(ctx, ctx.models.main, INDEX_SYSTEM, 2000);
+  let chunkTokens = Math.min(6000, indexBudget.input - 300);
+  for (const [si, src] of sources.entries()) {
+    let chunks = splitIntoChunks(src.text, chunkTokens);
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const lines = chunks[ci];
+      const user = `Fichier : ${src.file} — ${src.label}\nRôle indiqué par l'étudiant : ${ROLE_LABEL[src.role] || ROLE_LABEL.auto}\nNuméros de questions déjà rencontrés : ${known.slice(-60).join(', ') || 'aucun'}\n\n${lines.map((l, i) => `L${i + 1}| ${l}`).join('\n')}`;
+      let segments;
+      try {
+        ({ parsed: { segments } = {} } = await chatWithFallback(ctx, { system: INDEX_SYSTEM, user, wantOut: 2000, step: 'index', label: `Lecture de « ${src.label} » (${si + 1}/${sources.length}${chunks.length > 1 ? `, partie ${ci + 1}/${chunks.length}` : ''})`, sizeSensitive: true, effort: 'low' }));
+      } catch (err) {
+        if (err instanceof TooLarge && chunkTokens > 500) {
+          // Morceau encore trop gros pour les limites réelles : on le redécoupe
+          chunkTokens = Math.floor(chunkTokens / 2);
+          const rest = chunks.slice(ci).flat().join('\n');
+          chunks = [...chunks.slice(0, ci), ...splitIntoChunks(rest, chunkTokens)];
+          ci--;
+          continue;
+        }
+        if (err.code === 'aborted' || err.status === 401) throw err;
+        ctx.notes.push(`Découpage automatique impossible pour « ${src.label} » (${err.message}) : document traité d'un bloc.`);
+        segments = [{ de: 1, a: lines.length, nature: src.role === 'auto' ? 'reponse' : src.role, question: 'general' }];
+      }
+      // Segments -> texte local intact (les lignes non couvertes suivent le segment précédent)
+      const segs = arr(segments).map((g) => ({ de: Math.max(1, Math.floor(num(g.de, 1))), a: Math.min(lines.length, Math.floor(num(g.a, lines.length))), nature: str(g.nature), question: str(g.question) }))
+        .filter((g) => g.a >= g.de).sort((x, y) => x.de - y.de);
+      if (!segs.length) segs.push({ de: 1, a: lines.length, nature: 'reponse', question: 'general' });
+      segs[0].de = 1;
+      for (let k = 0; k < segs.length; k++) segs[k].a = k + 1 < segs.length ? Math.max(segs[k].de, segs[k + 1].de - 1) : lines.length;
+      for (const g of segs) {
+        let nature = ['enonce', 'reponse', 'bareme', 'autre'].includes(g.nature) ? g.nature : 'reponse';
+        if (src.role && src.role !== 'auto' && nature !== 'autre') nature = src.role;
+        if (nature === 'autre') continue;
+        const text = lines.slice(g.de - 1, g.a).join('\n').trim();
+        if (!text) continue;
+        seen[nature].add(src.file);
+        const key = normQ(g.question);
+        const tagged = `(${src.label})\n${text}`;
+        if (key === 'general') general[nature].push(tagged);
+        else {
+          if (!units.has(key)) {
+            units.set(key, { key, label: g.question.trim() || key, enonce: [], reponse: [], bareme: [] });
+            known.push(g.question.trim() || key);
+          }
+          units.get(key)[nature].push(tagged);
+        }
+      }
+    }
+  }
+  return { units: [...units.values()], general, seen };
+}
+
+/** Contexte commun trop long : condensé (données et schémas conservés). */
+async function condense(ctx, text, maxTokens) {
+  if (est(text) <= maxTokens) return text;
+  const system = 'Tu condenses le contexte commun d\'un énoncé d\'informatique pour un correcteur. Conserve INTÉGRALEMENT les données chiffrées, schémas de tables, signatures de fonctions, contraintes et barème ; supprime les répétitions et le texte décoratif. Réponds en texte brut (Markdown autorisé).';
+  const parts = splitIntoChunks(text, Math.max(800, budgetFor(ctx, ctx.models.main, system, 1500).input - 200));
+  const per = Math.max(200, Math.floor(maxTokens / parts.length));
+  const out = [];
+  for (const [i, p] of parts.entries()) {
+    try {
+      const { parsed } = await chatWithFallback(ctx, { system, user: `Condense en ${per * 3} caractères maximum :\n\n${p.join('\n')}`, json: false, wantOut: Math.min(1500, per + 200), step: 'index', label: `Résumé du contexte (${i + 1}/${parts.length})`, effort: 'low' });
+      out.push(parsed);
+    } catch (err) {
+      if (err.code === 'aborted' || err.status === 401) throw err;
+      out.push(p.join('\n'));
+    }
+  }
+  return sliceText(out.join('\n\n'), maxTokens);
+}
+
+function unitText(u, maxTokens) {
+  const block = (title, list) => (list.length ? `[${title}]\n${list.join('\n\n')}\n` : '');
+  let enonce = u.enonce.join('\n\n');
+  let bareme = u.bareme.join('\n\n');
+  let reponse = u.reponse.join('\n\n');
+  const total = () => est(enonce) + est(bareme) + est(reponse) + 30;
+  // Si une seule question dépasse le budget : on raccourcit d'abord l'énoncé et le barème, puis la réponse
+  if (total() > maxTokens) enonce = sliceText(enonce, Math.max(300, Math.floor(maxTokens * 0.25)));
+  if (total() > maxTokens) bareme = sliceText(bareme, Math.max(200, Math.floor(maxTokens * 0.15)));
+  if (total() > maxTokens) reponse = sliceText(reponse, Math.max(400, maxTokens - est(enonce) - est(bareme) - 30));
+  return `### Question ${u.label}\n${block('ÉNONCÉ', enonce ? [enonce] : [])}${block('BARÈME / CORRIGÉ DU PROFESSEUR', bareme ? [bareme] : [])}${block('RÉPONSE DE L\'ÉTUDIANT', reponse ? [reponse] : ['(aucune réponse trouvée pour cette question)'])}`;
+}
+
+async function correctChunked(ctx, sources, consigne, runCode) {
+  ctx.progress({ step: 'index', message: 'Documents volumineux : correction découpée, un document puis un lot de questions à la fois…' });
+  const { sources: capped, truncated } = fitSources(sources, ctx.s.maxInputChars);
+  if (truncated) ctx.notes.push(`Les documents dépassent ${ctx.s.maxInputChars.toLocaleString('fr-FR')} caractères : la fin a été ignorée (réglable dans les Réglages).`);
+  const { units, general, seen } = await indexDocuments(ctx, capped);
+  const partialSystem = buildPartialPrompt(ctx.s);
+  const b = budgetFor(ctx, ctx.models.main, partialSystem, 6000);
+  // Contexte commun (présentation, données…) : au plus 30 % du budget de chaque lot
+  const sharedRaw = [...general.enonce, ...general.bareme.map((t) => `[BARÈME / CORRIGÉ]\n${t}`)].join('\n\n');
+  const shared = sharedRaw ? await condense(ctx, sharedRaw, Math.floor(b.input * 0.3)) : '';
+  if (general.reponse.length) units.push({ key: 'general', label: 'Réponses sans numéro', enonce: [], bareme: [], reponse: general.reponse });
+  if (!units.length) throw new Error('Aucune question ni réponse n\'a pu être repérée dans les documents.');
+  const head = `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}${shared ? `CONTEXTE COMMUN DE L'ÉNONCÉ :\n${shared}\n\n` : ''}QUESTIONS À CORRIGER DANS CE LOT :\n\n`;
+  const room = Math.max(600, b.input - est(head) - 400);
+  // Lots de questions qui tiennent dans le budget
+  const batches = [];
+  let cur = [];
+  let size = 0;
+  for (const u of units) {
+    const t = unitText(u, room);
+    if (cur.length && size + est(t) > room) {
+      batches.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push({ u, t });
+    size += est(t);
+  }
+  if (cur.length) batches.push(cur);
+
+  const merged = { questions: [], fautes: [], points_forts: [], ameliorations: [], a_revoir: [], modele: [], executions: [] };
+  let model = ctx.models.main;
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const labels = batch.map((x) => x.u.label).join(', ');
+    const docs = batch.map((x) => x.t).join('\n\n');
+    let executions = [];
+    try {
+      executions = await verifyByExecution(ctx, `${head}${docs}`, '', runCode, { sizeSensitive: true });
+    } catch (err) {
+      if (!(err instanceof TooLarge)) throw err;
+    }
+    const user = `${head}${docs}${executionsBlock(executions)}\n\nRéponds uniquement avec l'objet JSON demandé.`;
+    let parsed;
+    try {
+      ({ parsed, model } = await chatWithFallback(ctx, { system: partialSystem, user, step: 'correction', label: `Correction des questions ${labels} (lot ${i + 1}/${batches.length})`, sizeSensitive: true }));
+    } catch (err) {
+      if (err instanceof TooLarge && batch.length > 1) {
+        // Lot encore trop gros pour les limites réelles : on le coupe en deux
+        const half = Math.ceil(batch.length / 2);
+        batches.splice(i, 1, batch.slice(0, half), batch.slice(half));
+        i--;
+        continue;
+      }
+      if (err instanceof TooLarge) {
+        // Une seule question trop grosse : on la raccourcit fortement
+        batch[0].t = unitText(batch[0].u, Math.floor(room / 2));
+        if (room > 1200 && !batch[0].shrunk) {
+          batch[0].shrunk = true;
+          i--;
+          continue;
+        }
+      }
+      throw err;
+    }
+    merged.questions.push(...arr(parsed.questions));
+    merged.fautes.push(...arr(parsed.fautes));
+    merged.points_forts.push(...arr(parsed.points_forts));
+    merged.ameliorations.push(...arr(parsed.ameliorations));
+    merged.a_revoir.push(...arr(parsed.a_revoir));
+    if (parsed.correction_modele) merged.modele.push(str(parsed.correction_modele));
+    merged.executions.push(...executions);
+  }
+
+  // Synthèse (entrée compacte : résultats déjà établis)
+  const pts = (q) => `${num(q.points_obtenus)}/${num(q.points_max)}`;
+  const synthUser = sliceText(`Fichiers : ${capped.map((s) => s.file).filter((v, i, a) => a.indexOf(v) === i).join(', ')}
+Énoncé repéré dans : ${[...seen.enonce].join(', ') || 'aucun fichier (questions déduites des réponses)'}
+Réponses repérées dans : ${[...seen.reponse].join(', ') || '—'}
+Barème repéré dans : ${[...seen.bareme].join(', ') || '—'}
+
+RÉSULTATS PAR QUESTION :
+${merged.questions.map((q) => `- ${str(q.numero)} [${str(q.statut)}] ${pts(q)} — ${str(q.intitule).slice(0, 120)} : ${str(q.commentaire).slice(0, 200)}`).join('\n')}
+
+FAUTES :
+${merged.fautes.map((f) => `- (${str(f.gravite)}) ${str(f.notion || f.categorie)} : ${str(f.description).slice(0, 180)}`).join('\n') || '(aucune)'}
+
+POINTS FORTS : ${merged.points_forts.map(str).join(' ; ').slice(0, 1500)}
+CONSEILS : ${merged.ameliorations.map((a) => str(a.titre || a)).join(' ; ').slice(0, 1500)}
+NOTIONS À REVOIR : ${merged.a_revoir.map((a) => `${str(a.notion || a)} (${str(a.priorite)})`).join(' ; ').slice(0, 1500)}`, Math.max(1500, budgetFor(ctx, ctx.models.main, SYNTH_SYSTEM, 2500).input - 100));
+  let synth = {};
+  try {
+    ({ parsed: synth } = await chatWithFallback(ctx, { system: SYNTH_SYSTEM, user: synthUser, wantOut: 2500, step: 'synthese', label: 'Synthèse finale' }));
+  } catch (err) {
+    if (err.code === 'aborted' || err.status === 401) throw err;
+    ctx.notes.push(`Synthèse finale incomplète (${err.message}).`);
+  }
+  const raw = {
+    titre: synth.titre,
+    matiere: synth.matiere,
+    type_exercice: synth.type_exercice,
+    langage: synth.langage,
+    identification: { enonce: [...seen.enonce], reponses: [...seen.reponse], bareme: [...seen.bareme], enonce_present: seen.enonce.size > 0, remarques: `${str(synth.remarques_identification)} (Correction découpée en ${batches.length} lot(s) pour respecter les limites du modèle.)`.trim() },
+    // La note est recalculée à partir des points des questions
+    appreciation: synth.appreciation,
+    resume: synth.resume,
+    points_forts: arr(synth.points_forts).length ? synth.points_forts : merged.points_forts.slice(0, 6),
+    questions: merged.questions,
+    fautes: merged.fautes,
+    ameliorations: arr(synth.ameliorations).length ? synth.ameliorations : merged.ameliorations.slice(0, 8),
+    a_revoir: arr(synth.a_revoir).length ? synth.a_revoir : merged.a_revoir.slice(0, 10),
+    correction_modele: merged.modele.join('\n\n---\n\n'),
+    mots_cles: synth.mots_cles
+  };
+  const result = normalizeResult(raw, ctx.s.gradeMax);
+  result.executions = merged.executions;
+  ctx.notes.push(`Documents volumineux : correction réalisée en ${batches.length} lot(s) successifs pour respecter les limites de ${ctx.models.main}.`);
+  return { result, model, mode: 'chunked' };
+}
+
+/** Choisit automatiquement : un seul appel si tout tient dans les limites du modèle, sinon correction découpée. */
+async function runCorrection(ctx, sources, consigne, runCode) {
+  try {
+    return await correctSingle(ctx, sources, consigne, runCode);
+  } catch (err) {
+    if (!(err instanceof TooLarge)) throw err;
+    return correctChunked(ctx, sources, consigne, runCode);
+  }
 }
 
 async function correct(ctx, { files, consigne, runCode }) {
   const sources = await buildSources(files, ctx);
   if (!sources.length) throw new Error("Aucun contenu exploitable n'a pu être extrait des fichiers fournis.");
-  const executions = await verifyByExecution(ctx, sources, consigne, runCode);
-  const out = await runCorrection(ctx, sources, consigne, executions);
+  const out = await runCorrection(ctx, sources, consigne, runCode);
   return { ...out, sources, warnings: ctx.notes };
 }
 
 async function recorrect(ctx, { sources, consigne, runCode }) {
-  const executions = await verifyByExecution(ctx, sources, consigne, runCode);
-  const out = await runCorrection(ctx, sources, consigne, executions);
+  const out = await runCorrection(ctx, sources, consigne, runCode);
   return { ...out, sources, warnings: ctx.notes };
 }
 
@@ -413,7 +771,7 @@ Fautes :
 ${result.fautes.map((f) => `- [${f.gravite}] ${f.notion || f.categorie} : ${f.description} → ${f.correction}`).join('\n') || '(aucune)'}
 Notions à revoir :
 ${result.a_revoir.map((a) => `- ${a.notion} : ${a.pourquoi}`).join('\n') || '(aucune)'}`;
-  const { parsed } = await chatWithFallback(ctx, { system, user, maxTokens: 4000, step: 'flashcards', label: 'Création des fiches' });
+  const { parsed } = await chatWithFallback(ctx, { system, user: sliceText(user, budgetFor(ctx, ctx.models.main, system, 3000).input - 50), wantOut: 3000, step: 'flashcards', label: 'Création des fiches', effort: 'low' });
   return arr(parsed.fiches).map((f) => ({ front: str(f.recto), back: str(f.verso), notion: str(f.notion) })).filter((f) => f.front && f.back);
 }
 
@@ -428,7 +786,7 @@ Matière : ${matiere || 'au choix'}
 Type : ${type || 'au choix'}
 Difficulté : ${difficulte}
 ${consigne ? `Demande particulière : ${consigne}` : ''}`;
-  const { parsed, model } = await chatWithFallback(ctx, { system, user, maxTokens: 5000, step: 'exercise', label: 'Création de l\'exercice' });
+  const { parsed, model } = await chatWithFallback(ctx, { system, user, wantOut: 4000, step: 'exercise', label: 'Création de l\'exercice' });
   return {
     titre: str(parsed.titre) || 'Exercice d\'entraînement',
     matiere: str(parsed.matiere) || matiere || '',
@@ -442,7 +800,82 @@ ${consigne ? `Demande particulière : ${consigne}` : ''}`;
   };
 }
 
+// ---------------------------------------------------------------- Discussion avec l'IA (tuteur)
+const TUTOR_SYSTEM = (s) => `Tu es le tuteur personnel d'un étudiant en ${s.level}. Il vient de recevoir la correction d'un devoir (fournie ci-dessous avec ses documents) et te pose des questions dessus.
+Réponds en français, en le tutoyant, de façon claire, pédagogique et concise : explique le pourquoi, donne des exemples, propose une petite question de vérification si utile.
+Appuie-toi sur sa copie et sur la correction ; si tu n'es pas d'accord avec la correction, dis-le honnêtement et explique pourquoi.
+Markdown autorisé, maths en LaTeX $…$, code dans des blocs \`\`\`. Ne recopie pas toute la correction : réponds à la question posée.`;
+
+function correctionDigest(rec, maxTokens) {
+  const r = rec.result;
+  const lines = [
+    `DEVOIR : ${r.titre} (${r.matiere || 'matière non précisée'}) — note ${r.note.obtenue}/${r.note.sur}`,
+    `Appréciation : ${r.appreciation}`,
+    `Résumé : ${r.resume}`,
+    'QUESTIONS :',
+    ...r.questions.map((q) => `- ${q.numero} [${q.statut}] ${q.points_obtenus}/${q.points_max} — ${q.intitule} : ${q.commentaire}`),
+    'FAUTES :',
+    ...r.fautes.map((f, i) => `${i + 1}. (${f.gravite}, question ${f.question}) ${f.notion || f.categorie} : ${f.description}${f.extrait ? ` | extrait : ${f.extrait}` : ''}${f.correction ? ` | correction : ${f.correction}` : ''}`),
+    `À REVOIR : ${r.a_revoir.map((a) => a.notion).join(', ')}`,
+    ...(r.executions?.length ? ['TESTS EXÉCUTÉS :', ...r.executions.map((e) => `- ${e.but} : ${e.ok ? 'OK' : 'échec'} — sortie : ${(e.stdout || e.stderr || '').slice(0, 300)}`)] : [])
+  ];
+  const digest = sliceText(lines.join('\n'), Math.floor(maxTokens * 0.6));
+  const modele = r.correction_modele ? sliceText(`CORRECTION MODÈLE :\n${r.correction_modele}`, Math.floor(maxTokens * 0.4)) : '';
+  return `${digest}\n\n${modele}`;
+}
+
+/**
+ * Réponse du tuteur. Le contexte (correction + documents + historique) est dimensionné pour
+ * tenir dans les limites du modèle : documents tronqués et anciens messages résumés si nécessaire.
+ */
+async function chatAbout(ctx, rec, history, question) {
+  const system = TUTOR_SYSTEM(ctx.s);
+  const b = budgetFor(ctx, ctx.models.main, system, 2500);
+  const room = b.input - est(question) - 200;
+  const digest = correctionDigest(rec, Math.floor(room * 0.35));
+  // Historique récent (du plus récent au plus ancien, tant que ça tient)
+  const histRoom = Math.floor(room * 0.25);
+  const hist = [];
+  let used = 0;
+  for (const m of [...history].reverse()) {
+    const t = `${m.role === 'user' ? 'ÉTUDIANT' : 'TUTEUR'} : ${m.content}`;
+    if (used + est(t) > histRoom) break;
+    hist.unshift(t);
+    used += est(t);
+  }
+  const docsRoom = Math.max(300, room - est(digest) - used);
+  const { sources: docs } = fitSources(rec.sources || [], Math.floor(docsRoom * 3.2));
+  const user = `${digest}\n\nDOCUMENTS DE L'ÉTUDIANT :\n${documentsBlock(docs)}\n\n${hist.length ? `DISCUSSION PRÉCÉDENTE :\n${hist.join('\n\n')}\n\n` : ''}NOUVELLE QUESTION DE L'ÉTUDIANT :\n${question}`;
+  const { parsed, model } = await chatWithFallback(ctx, { system, user, json: false, wantOut: 2500, step: 'chat', label: 'Réponse du tuteur' });
+  return { content: String(parsed).trim(), model };
+}
+
+// ---------------------------------------------------------------- Annotation de la copie (localisation des fautes sur les photos)
+const LOCATE_PROMPT = (fautes) => `Voici la photo d'une page de copie d'un étudiant et la liste des fautes relevées par le correcteur.
+Pour chaque faute VISIBLE sur cette page, donne la zone où elle se trouve, sous forme de rectangle(s) [x0, y0, x1, y1] en coordonnées normalisées de 0 à 1000 (origine en haut à gauche). Ignore les fautes absentes de cette page. Encadre précisément le passage fautif (une ligne ou un bloc), pas toute la page.
+FAUTES :
+${fautes.map((f, i) => `${i + 1}. ${f.extrait ? `« ${f.extrait.slice(0, 160)} » — ` : ''}${f.description.slice(0, 160)}`).join('\n')}
+Réponds UNIQUEMENT en JSON : {"annotations":[{"faute":1,"boites":[[x0,y0,x1,y1]]}]}`;
+
+async function locateFaultsOnImage(ctx, base64, fautes) {
+  if (!ctx.models.vision) throw new Error('Aucun modèle de vision disponible pour localiser les fautes sur les photos.');
+  const r = await ctx.ai.chat({
+    model: ctx.models.vision,
+    temperature: 0,
+    maxTokens: Math.min(2000, limitsFor(ctx, ctx.models.vision).maxOut),
+    json: true,
+    signal: ctx.signal,
+    messages: [{ role: 'user', content: [{ type: 'text', text: LOCATE_PROMPT(fautes) }, { type: 'image', mime: 'image/jpeg', base64 }] }]
+  });
+  const parsed = parseJsonLoose(r.content);
+  return arr(parsed.annotations).map((a) => ({
+    faute: Math.floor(num(a.faute)) - 1,
+    boxes: arr(a.boites || a.boxes).filter((x) => Array.isArray(x) && x.length === 4).map((x) => x.map((v) => Math.max(0, Math.min(1000, num(v))) / 1000))
+  })).filter((a) => a.faute >= 0 && a.faute < fautes.length && a.boxes.length);
+}
+
 module.exports = {
   correct, recorrect, generateFlashcards, generateExercise, normalizeResult, buildName, fitSources, parseJsonLoose,
-  buildSystemPrompt, hasRunnableCode, DEFAULTS, EXERCISE_TYPES, TYPE_LABELS, VISION_PROMPT
+  buildSystemPrompt, hasRunnableCode, chatWithFallback, chatAbout, locateFaultsOnImage, budgetFor, sliceText, splitIntoChunks, normQ, TooLarge,
+  DEFAULTS, EXERCISE_TYPES, TYPE_LABELS, VISION_PROMPT
 };

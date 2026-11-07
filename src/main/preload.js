@@ -71,6 +71,30 @@ contextBridge.exposeInMainWorld('api', {
   installUpdate: () => invoke('update:install'),
   updateState: () => invoke('update:state'),
   onUpdateStatus: on('update:status'),
+  // File d'attente
+  queueAdd: (jobs) => invoke('queue:add', jobs),
+  queueList: () => invoke('queue:list'),
+  queueCancel: (id) => invoke('queue:cancel', id),
+  queueRetry: (id) => invoke('queue:retry', id),
+  queueRemove: (id) => invoke('queue:remove', id),
+  queueClear: () => invoke('queue:clear'),
+  queuePause: (p) => invoke('queue:pause', p),
+  onQueueUpdate: on('queue:update'),
+  onNavResult: on('nav:result'),
+  // Discussion
+  chatList: (id) => invoke('chat:list', id),
+  chatSend: (id, text) => invoke('chat:send', id, text),
+  chatClear: (id) => invoke('chat:clear', id),
+  onChatProgress: on('chat:progress'),
+  // Copie annotée
+  readPage: (rel) => invoke('page:read', rel),
+  locateFaults: (id) => invoke('annotate:locate', id),
+  onAnnotateProgress: on('annotate:progress'),
+  // Sauvegardes automatiques / réinitialisation
+  autoBackups: () => invoke('backup:listAuto'),
+  restoreAutoBackup: (file) => invoke('backup:restoreAuto', file),
+  openBackupDir: () => invoke('backup:openDir'),
+  resetApp: (opts) => invoke('app:reset', opts),
   // Paramètres
   getSettings: () => invoke('settings:get'),
   saveSettings: (prefs) => invoke('settings:save', prefs),

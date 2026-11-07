@@ -31,8 +31,12 @@ function template() {
       <label class="label" for="consigne"><i class="fa-solid fa-comment-dots"></i> Indications pour le correcteur (facultatif)</label>
       <textarea id="consigne" rows="2" placeholder="Ex. : TD2 de R1.05, exercice 3 uniquement · barème sur 10 · SQL Oracle · ne pas pénaliser l'orthographe…"></textarea>
     </div>
-    <div class="row" style="justify-content:flex-end;margin-top:16px">
+    <div class="row wrap" style="justify-content:flex-end;margin-top:16px">
+      <label class="check" style="margin-right:auto" title="Pratique pour corriger plusieurs copies (TP de groupe, plusieurs essais) avec le même sujet">
+        <input type="checkbox" id="batch-mode" /><span>Une copie par fichier<small>Chaque fichier « Mes réponses » est corrigé séparément avec l'énoncé et le barème marqués.</small></span>
+      </label>
       <button class="btn ghost" id="btn-clear"><i class="fa-solid fa-trash-can"></i>Tout effacer</button>
+      <button class="btn" id="btn-queue" disabled title="La correction se fait en arrière-plan : tu peux continuer à utiliser l'application ou la fermer, elle reprendra au prochain lancement."><i class="fa-solid fa-list-check"></i>Ajouter à la file d'attente</button>
       <button class="btn primary big" id="btn-correct" disabled><i class="fa-solid fa-wand-magic-sparkles"></i><span>Lancer la correction</span></button>
     </div>
     <div id="progress" class="card progress-card hidden">
@@ -49,7 +53,7 @@ function template() {
 async function addPaths(paths) {
   for (const p of paths) {
     if (!p || files.some((f) => f.path === p)) continue;
-    const f = { id: ++seq, path: p, name: p.split(/[\\/]/).pop() || p, status: 'loading', parts: [], warnings: [], role: 'auto', info: 'Lecture…' };
+    const f = { id: ++seq, path: p, name: p.split(/[\\/]/).pop() || p, status: 'loading', parts: [], previews: [], warnings: [], role: 'auto', info: 'Lecture…' };
     files.push(f);
     renderFiles();
     processFile(f);
@@ -66,9 +70,12 @@ async function normalizeParts(f, parts) {
       });
       out.push(...r.parts);
       f.warnings.push(...r.warnings);
+      f.previews.push(...(r.previews || []).map((pv) => ({ ...pv, file: f.name })));
     } else if (p.type === 'image') {
       try {
-        out.push({ ...p, ...(await normalizeImage(p.base64, p.mime)) });
+        const img = await normalizeImage(p.base64, p.mime);
+        out.push({ ...p, ...img });
+        f.previews.push({ file: f.name, label: p.label, base64: img.base64, w: img.width, h: img.height });
       } catch {
         f.warnings.push(`${p.label} : image illisible.`);
       }
@@ -105,7 +112,7 @@ async function processFile(f) {
 
 /** Ajoute un fichier déjà en mémoire (capture collée, photo du téléphone). */
 export async function addMemoryFile(name, mime, base64) {
-  const f = { id: ++seq, path: `${name}#${seq}`, name, status: 'loading', parts: [], warnings: [], role: 'auto', info: 'Lecture…' };
+  const f = { id: ++seq, path: `${name}#${seq}`, name, status: 'loading', parts: [], previews: [], warnings: [], role: 'auto', info: 'Lecture…' };
   files.push(f);
   renderFiles();
   f.parts = await normalizeParts(f, [{ type: mime === 'application/pdf' ? 'pdf' : 'image', mime, base64, label: name }]);
@@ -144,7 +151,8 @@ function renderFiles() {
   const loading = files.some((f) => f.status === 'loading');
   const btn = $('#btn-correct');
   btn.disabled = !ready.length || loading || busy;
-  $('span', btn).textContent = loading ? 'Lecture des fichiers…' : `Lancer la correction${ready.length ? ` (${ready.length} fichier${ready.length > 1 ? 's' : ''})` : ''}`;
+  $('#btn-queue').disabled = !ready.length || loading;
+  $('span', btn).textContent = loading ? 'Lecture des fichiers…' : $('#batch-mode')?.checked ? 'Corriger chaque copie (file d\'attente)' : `Lancer la correction${ready.length ? ` (${ready.length} fichier${ready.length > 1 ? 's' : ''})` : ''}`;
 }
 
 async function runCorrection() {
@@ -153,8 +161,11 @@ async function runCorrection() {
     go('settings');
     return;
   }
-  const payload = files.filter((f) => f.status === 'ready').map((f) => ({ name: f.name, role: f.role, parts: f.parts }));
+  if ($('#batch-mode').checked) return addToQueue();
+  const ready = files.filter((f) => f.status === 'ready');
+  const payload = ready.map((f) => ({ name: f.name, role: f.role, parts: f.parts }));
   if (!payload.length) return;
+  const previews = ready.flatMap((f) => (f.role === 'enonce' ? [] : f.previews));
   busy = true;
   renderFiles();
   const prog = $('#progress');
@@ -172,7 +183,7 @@ async function runCorrection() {
     $('#progress-bar').style.width = `${pct}%`;
   });
   try {
-    const { id, warnings } = await api.correct({ files: payload, consigne: $('#consigne').value.trim() });
+    const { id, warnings } = await api.correct({ files: payload, consigne: $('#consigne').value.trim(), previews });
     warnings?.forEach((w) => toast(w, 'warn', 9000));
     files.length = 0;
     $('#consigne').value = '';
@@ -185,6 +196,40 @@ async function runCorrection() {
     busy = false;
     prog.classList.add('hidden');
     renderFiles();
+  }
+}
+
+/** Prépare une ou plusieurs tâches pour la file d'attente (mode lot : une copie par fichier). */
+function buildJobs() {
+  const ready = files.filter((f) => f.status === 'ready');
+  const consigne = $('#consigne').value.trim();
+  const toPayload = (f) => ({ name: f.name, role: f.role, parts: f.parts });
+  if (!$('#batch-mode').checked) {
+    return [{ title: ready.map((f) => f.name).join(', '), files: ready.map(toPayload), consigne, previews: ready.flatMap((f) => (f.role === 'enonce' ? [] : f.previews)) }];
+  }
+  const shared = ready.filter((f) => f.role === 'enonce' || f.role === 'bareme');
+  const copies = ready.filter((f) => f.role === 'reponse' || f.role === 'auto');
+  if (!shared.some((f) => f.role === 'enonce')) throw new Error('Mode « une copie par fichier » : indique quel fichier est l\'énoncé (menu « 📋 Énoncé »).');
+  if (!copies.length) throw new Error('Aucune copie à corriger : marque les fichiers de réponses en « ✍️ Mes réponses ».');
+  return copies.map((c) => ({ title: c.name, files: [...shared.map(toPayload), { ...toPayload(c), role: 'reponse' }], consigne, previews: c.previews }));
+}
+
+async function addToQueue() {
+  let jobs;
+  try {
+    jobs = buildJobs();
+  } catch (err) {
+    toast(err.message, 'warn', 7000);
+    return;
+  }
+  try {
+    await api.queueAdd(jobs);
+    toast(`${jobs.length} correction(s) ajoutée(s) à la file d'attente.`, 'ok', 5000, { label: 'Voir', onClick: () => go('queue') });
+    files.length = 0;
+    $('#consigne').value = '';
+    renderFiles();
+  } catch (err) {
+    toast(err.message, 'error', 8000);
   }
 }
 
@@ -237,6 +282,11 @@ function mount(root) {
   $('#btn-phone', root).onclick = (e) => { e.stopPropagation(); phoneDialog(); };
   dz.onclick = async () => addPaths(await api.pickFiles());
   $('#btn-correct', root).onclick = runCorrection;
+  $('#btn-queue', root).onclick = addToQueue;
+  $('#batch-mode', root).onchange = (e) => {
+    $('span', $('#btn-correct', root)).textContent = e.target.checked ? 'Corriger chaque copie (file d\'attente)' : 'Lancer la correction';
+    if (e.target.checked) toast('Marque l\'énoncé (et le barème) avec le menu de chaque fichier ; les autres fichiers seront corrigés un par un.', 'info', 7000);
+  };
   $('#btn-cancel', root).onclick = () => api.cancel();
   $('#btn-clear', root).onclick = () => { files.length = 0; renderFiles(); };
 

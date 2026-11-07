@@ -107,7 +107,7 @@ async function render(root) {
           <option value="auto">Auto : texte + image des pages scannées, manuscrites ou avec figures</option>
           <option value="always">Toujours analyser l'image de chaque page (plus précis, plus lent)</option>
           <option value="text">Texte seulement (le plus rapide)</option></select></div>
-        <div class="field"><label class="label">Taille max. envoyée à l'IA (caractères)</label><input id="s-max" type="number" min="4000" step="1000" value="${s.maxInputChars}" /></div>
+        <div class="field"><label class="label">Taille max. analysée (caractères) — au-delà des limites du modèle, la correction est découpée automatiquement</label><input id="s-max" type="number" min="4000" step="1000" value="${s.maxInputChars}" /></div>
       </div>
       <label class="check" style="margin-top:12px"><input type="checkbox" id="s-exec" ${s.executeCode ? 'checked' : ''} /><span>Exécuter mon code pour vérifier les réponses<small>Python, JavaScript et SQL intégrés ; Java, C, C++, PHP si installés sur le PC. Ajoute un appel à l'IA par correction.</small></span></label>
       <label class="check"><input type="checkbox" id="s-cards" ${s.autoFlashcards ? 'checked' : ''} /><span>Créer automatiquement des fiches de révision après chaque correction<small>À partir des fautes et des notions à revoir.</small></span></label>
@@ -148,6 +148,19 @@ async function render(root) {
           <span class="xs dim">${s.lastSyncAt ? `Dernière synchro : ${new Date(s.lastSyncAt).toLocaleString('fr-FR')}` : ''}</span>`
         : '<button class="btn" id="s-sync-dir"><i class="fa-solid fa-folder-open"></i>Choisir le dossier synchronisé</button>'}
       </div>
+    </div>
+
+    <div class="card">
+      <h2><i class="fa-solid fa-clock-rotate-left"></i>Sauvegardes automatiques</h2>
+      <p class="small muted" style="margin-top:-6px">Tes données sont conservées lors des mises à jour (elles ne sont jamais dans le dossier de l'application). Par sécurité, une copie est faite automatiquement chaque jour, avant chaque mise à jour et avant toute réinitialisation ou restauration (10 dernières conservées).</p>
+      <div class="list" id="s-autobk"><div class="small dim">Chargement…</div></div>
+      <div class="row" style="margin-top:10px"><button class="btn sm" id="s-open-bk"><i class="fa-solid fa-folder-open"></i>Ouvrir le dossier des sauvegardes</button></div>
+    </div>
+
+    <div class="card danger-zone">
+      <h2><i class="fa-solid fa-triangle-exclamation"></i>Réinitialiser l'application</h2>
+      <p class="small muted" style="margin-top:-6px">Efface les données de cette installation. Une sauvegarde automatique est créée juste avant : tu pourras tout récupérer depuis la liste ci-dessus.</p>
+      <button class="btn danger" id="s-reset"><i class="fa-solid fa-rotate-left"></i>Réinitialiser…</button>
     </div>`;
   $('#s-sev', root).value = s.severity;
   $('#s-pdf', root).value = s.pdfMode;
@@ -249,7 +262,72 @@ function bind(root, s, prov) {
     } catch (err) { toast(err.message, 'error', 8000); }
   });
   $('#s-sync-off', root)?.addEventListener('click', async () => { state.settings = await api.disableSync(); render(root); });
+  loadAutoBackups(root);
+  $('#s-open-bk', root).onclick = () => api.openBackupDir();
+  $('#s-reset', root).onclick = () => resetDialog(root);
   void modal;
+}
+
+const REASONS = { quotidienne: 'quotidienne', 'avant-mise-a-jour': 'avant mise à jour', 'avant-reinitialisation': 'avant réinitialisation', 'avant-restauration': 'avant restauration', auto: 'automatique' };
+
+async function loadAutoBackups(root) {
+  const box = $('#s-autobk', root);
+  try {
+    const list = await api.autoBackups();
+    box.innerHTML = list.map((b) => `
+      <div class="item" style="cursor:default">
+        <div class="item-icon"><i class="fa-solid fa-box-archive"></i></div>
+        <div class="item-main"><div class="item-name">${new Date(b.date).toLocaleString('fr-FR')}</div><div class="item-meta">Sauvegarde ${esc(REASONS[b.reason] || b.reason)} · v${esc(b.version)} · ${(b.size / 1024).toFixed(0)} Ko</div></div>
+        <button class="btn sm" data-restore="${esc(b.file)}"><i class="fa-solid fa-clock-rotate-left"></i>Restaurer</button>
+      </div>`).join('') || '<div class="small dim">Aucune sauvegarde automatique pour l\'instant (la première est créée au prochain démarrage).</div>';
+    $$('[data-restore]', box).forEach((btn) => (btn.onclick = async () => {
+      if (!(await confirmBox('Restaurer cette sauvegarde', 'Les données actuelles seront remplacées par celles de cette sauvegarde (une copie de l\'état actuel est faite avant). Continuer ?', 'Restaurer'))) return;
+      try {
+        await api.restoreAutoBackup(btn.dataset.restore);
+        state.folders = await api.folders();
+        toast('Sauvegarde restaurée.', 'ok');
+        refreshStats();
+        loadAutoBackups(root);
+      } catch (err) { toast(err.message, 'error', 8000); }
+    }));
+  } catch (err) {
+    box.innerHTML = `<div class="small" style="color:var(--rose)">${esc(err.message)}</div>`;
+  }
+}
+
+async function resetDialog(root) {
+  const b = await modal({
+    title: 'Réinitialiser l\'application',
+    icon: 'fa-triangle-exclamation',
+    okLabel: 'Réinitialiser',
+    danger: true,
+    body: `
+      <p class="small muted" style="margin-top:0">Choisis ce qui doit être effacé. Une sauvegarde automatique est faite avant.</p>
+      <label class="check"><input type="checkbox" id="r-data" checked /><span>Toutes les données<small>Corrections, dossiers, fiches de révision, exercices, discussions, file d'attente, pages de copies.</small></span></label>
+      <label class="check"><input type="checkbox" id="r-prefs" /><span>Les réglages<small>Fournisseur d'IA, modèles, barème, synchronisation… (valeurs par défaut).</small></span></label>
+      <label class="check"><input type="checkbox" id="r-keys" /><span>Les clés API enregistrées</span></label>
+      <div class="field" style="margin-top:12px"><label class="label">Pour confirmer, tape <b>RÉINITIALISER</b></label><input id="r-confirm" autocomplete="off" /></div>`,
+    onOpen: (body) => {
+      const ok = $('#modal-ok');
+      const check = () => { ok.disabled = $('#r-confirm', body).value.trim().toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '') !== 'REINITIALISER' || !['#r-data', '#r-prefs', '#r-keys'].some((s) => $(s, body).checked); };
+      check();
+      body.addEventListener('input', check);
+      body.addEventListener('change', check);
+    }
+  });
+  $('#modal-ok').disabled = false;
+  if (!b) return;
+  const opts = { data: $('#r-data', b).checked, prefs: $('#r-prefs', b).checked, keys: $('#r-keys', b).checked };
+  try {
+    const r = await api.resetApp(opts);
+    state.settings = r.settings;
+    state.folders = await api.folders();
+    toast('Application réinitialisée. Une sauvegarde de l\'état précédent a été créée.', 'ok', 7000);
+    refreshStats();
+    render(root);
+  } catch (err) {
+    toast(err.message, 'error', 8000);
+  }
 }
 
 register('settings', { title: 'Réglages', show: (root) => render(root) });

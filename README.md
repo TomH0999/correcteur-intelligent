@@ -33,6 +33,11 @@ dans n'importe quel format — et l'application :
 | 📱 **Photo depuis le téléphone** | Scanne un QR code : les photos de ta copie arrivent directement dans l'app (même Wi-Fi). |
 | 💾 **Sauvegarde & synchro** | Export/import sans doublon ; synchronisation facultative entre tes PC via un dossier OneDrive / Google Drive / Dropbox. |
 | 📄 **Export** | Rapport en Markdown ou PDF. |
+| 💬 **Discuter avec l'IA** | Pose des questions sur chaque correction : le tuteur connaît ta copie, la correction et les tests. |
+| 📋 **File d'attente / lots** | Corrige plusieurs copies à la suite en arrière-plan (une copie par fichier avec le même énoncé) ; reprise automatique après fermeture, notification à la fin. |
+| 🖍️ **Copie annotée** | Les fautes sont surlignées directement sur ta copie : par le texte pour les PDF, par l'IA de vision pour les photos/scans, dans le texte pour le code. |
+| 🧩 **Gros devoirs** | Si les documents dépassent les limites du modèle (sortie max, jetons par minute de l'offre gratuite), la correction est automatiquement découpée : lecture document par document, correction par lots de questions, synthèse finale. |
+| 🛟 **Données protégées** | Conservées lors des mises à jour, sauvegarde automatique quotidienne et avant chaque mise à jour / réinitialisation, bouton de réinitialisation avec confirmation. |
 
 ## 📥 Installation
 
@@ -67,7 +72,7 @@ npm run dist:win   # construit l'installateur .exe (sous Windows)
 ```
 
 À chaque push, **GitHub Actions** (`.github/workflows/build-windows.yml`) lance les tests, construit l'installateur,
-lui attribue la version `1.1.<numéro de build>` et publie une Release avec `latest.yml` : c'est ce fichier que les
+lui attribue la version `1.2.<numéro de build>` et publie une Release avec `latest.yml` : c'est ce fichier que les
 applications installées consultent pour se mettre à jour.
 
 **Signature de code (facultatif)** : ajoute les secrets `WIN_CSC_LINK` (certificat `.pfx` en base64) et
@@ -79,7 +84,10 @@ src/main/          processus principal Electron
   extractors.js    conversion universelle fichier → texte / images / audio
   providers.js     Groq, OpenAI, Gemini, Ollama (API compatible OpenAI) et Anthropic (SDK officiel)
   models.js        liste des modèles en direct, test des modèles de vision, choix automatique
-  corrector.js     prompts, lecture des images, tests d'exécution, correction, fiches, exercices
+  corrector.js     prompts, lecture des images, tests d'exécution, correction (un appel ou découpée), tuteur, fiches, exercices
+  limits.js        limites des modèles (contexte, sortie max, jetons/minute) apprises en direct + régulateur de débit
+  queue.js         file d'attente persistante (reprise après redémarrage)
+  pages.js         aperçus des pages de copie pour l'affichage annoté
   runner.js        exécution de code (worker Python/JS/SQL + compilateurs locaux)
   ocr.js           OCR local Tesseract (secours hors ligne)
   db.js            SQLite (sql.js) : dossiers, corrections, fiches, exercices, tableau de bord, fusion

@@ -456,3 +456,37 @@ pre { background: var(--s950); border: 1px solid var(--s800); padding: 10px 12px
 
 /* Les cartes alignées en grille n'héritent pas de l'espacement vertical */
 .grid2 > .card, .grid3 > .card, .grid4 > .card, .compare-grid > .card { margin-top: 0; }
+
+/* ---------- Discussion avec l'IA ---------- */
+.chat-log { max-height: 460px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 12px; background: var(--s950); border: 1px solid var(--s800); border-radius: 12px; }
+.chat-msg { max-width: 88%; border-radius: 12px; padding: 10px 14px; background: var(--s900); border: 1px solid var(--s800); }
+.chat-msg.user { align-self: flex-end; background: rgb(37 99 235 / .18); border-color: rgb(59 130 246 / .35); }
+.chat-msg.error { border-color: rgb(244 63 94 / .4); color: var(--rose); }
+.chat-who { font-size: 11px; font-weight: 600; color: var(--s400); margin-bottom: 4px; }
+.chat-input { display: flex; gap: 8px; align-items: flex-end; }
+.chat-input textarea { min-height: 46px; }
+.chat-input .btn { min-height: 46px; }
+
+/* ---------- Copie annotée ---------- */
+.annot-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+.annot-side { position: sticky; top: 56px; max-height: calc(100vh - 160px); overflow-y: auto; }
+.annot-page + .annot-page { margin-top: 16px; }
+.annot-wrap { position: relative; width: 100%; background: #fff; border-radius: 8px; overflow: hidden; }
+.annot-wrap img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.annot-wrap svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.ann-box { cursor: pointer; }
+.ann-box rect { transition: stroke-width .15s; }
+.ann-box.active rect { stroke-width: 5; animation: pulse 1s ease 2; }
+@keyframes pulse { 50% { opacity: .4; } }
+.annot-fault { border-left: 4px solid var(--c); background: var(--s950); border-radius: 8px; padding: 8px 10px; margin-top: 8px; cursor: pointer; }
+.annot-fault.active { background: rgb(37 99 235 / .12); }
+.annot-num { width: 22px; height: 22px; border-radius: 50%; background: var(--c); color: var(--s950); font-weight: 800; font-size: 12px; display: grid; place-items: center; }
+.annot-text { white-space: pre-wrap; max-height: 70vh; overflow: auto; }
+.ann-mark { background: color-mix(in srgb, var(--c) 25%, transparent); color: inherit; border-bottom: 2px solid var(--c); border-radius: 3px; cursor: pointer; }
+.ann-mark sup { color: var(--c); font-weight: 800; margin-left: 2px; }
+.ann-mark.active { outline: 2px solid var(--c); }
+@media (max-width: 1150px) { .annot-layout { grid-template-columns: 1fr; } .annot-side { position: static; max-height: none; } }
+
+/* ---------- Réinitialisation ---------- */
+.danger-zone { border-color: rgb(244 63 94 / .35); }
+.danger-zone h2 > i { color: var(--rose); }

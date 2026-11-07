@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const initSqlJs = require('sql.js');
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 // Intervalles de révision (jours) par boîte de Leitner
 const BOX_DAYS = [0, 1, 2, 4, 8, 16, 32, 64];
 
@@ -119,7 +119,37 @@ class Database {
     add('corrections', 'kind', "TEXT DEFAULT 'correction'");
     add('corrections', 'exercise_id', 'INTEGER');
     add('corrections', 'updated_at', 'TEXT');
-    for (const t of ['folders', 'corrections', 'flashcards', 'exercises']) {
+    // v3 : pages de la copie (annotations), discussion avec l'IA, file d'attente
+    add('corrections', 'pages', 'TEXT');
+    add('corrections', 'annotations', 'TEXT');
+    this.x(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uuid TEXT UNIQUE,
+        correction_id INTEGER NOT NULL REFERENCES corrections(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        model TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_corr ON chat_messages(correction_id);
+      CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        payload_file TEXT NOT NULL,
+        consigne TEXT,
+        folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
+        correction_id INTEGER REFERENCES corrections(id) ON DELETE SET NULL,
+        error TEXT,
+        progress TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+      );
+    `);
+    for (const t of ['folders', 'corrections', 'flashcards', 'exercises', 'chat_messages']) {
       for (const r of this.all(`SELECT id FROM ${t} WHERE uuid IS NULL`)) this.x(`UPDATE ${t} SET uuid = ? WHERE id = ?`, [uuid(), r.id]);
     }
     this.x(`
@@ -217,13 +247,13 @@ class Database {
   saveCorrection(rec) {
     const r = rec.result || {};
     return this.run(
-      `INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, exercise_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, exercise_id, pages)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         rec.uuid || uuid(), rec.name, rec.folderId || null, rec.createdAt || now(), now(), r.matiere || null, r.type_exercice || null,
         r.score_pourcentage ?? null, r.note?.obtenue ?? null, r.note?.sur ?? null,
         JSON.stringify(rec.files || []), rec.consigne || '', JSON.stringify(r), JSON.stringify(rec.sources || []), rec.model || null,
-        Database.searchText(rec, r), rec.kind || 'correction', rec.exerciseId || null
+        Database.searchText(rec, r), rec.kind || 'correction', rec.exerciseId || null, rec.pages ? JSON.stringify(rec.pages) : null
       ]
     );
   }
@@ -234,7 +264,9 @@ class Database {
       ...row,
       files: JSON.parse(row.files || '[]'),
       result: row.result ? JSON.parse(row.result) : null,
-      sources: row.sources ? JSON.parse(row.sources) : []
+      sources: row.sources ? JSON.parse(row.sources) : [],
+      pages: row.pages ? JSON.parse(row.pages) : [],
+      annotations: row.annotations ? JSON.parse(row.annotations) : []
     };
   }
 
@@ -427,6 +459,78 @@ class Database {
     this.run('DELETE FROM exercises WHERE id = ?', [id]);
   }
 
+  setAnnotations(id, annotations) {
+    this.run('UPDATE corrections SET annotations = ?, updated_at = ? WHERE id = ?', [JSON.stringify(annotations || []), now(), id]);
+  }
+
+  setPages(id, pages) {
+    this.run('UPDATE corrections SET pages = ? WHERE id = ?', [JSON.stringify(pages || []), id]);
+  }
+
+  // ---------- Discussion avec l'IA ----------
+  listChat(correctionId) {
+    return this.all('SELECT * FROM chat_messages WHERE correction_id = ? ORDER BY id ASC', [correctionId]);
+  }
+
+  addChat(correctionId, role, content, model = null) {
+    return this.run('INSERT INTO chat_messages (uuid, correction_id, role, content, model, created_at) VALUES (?, ?, ?, ?, ?, ?)', [uuid(), correctionId, role, content, model, now()]);
+  }
+
+  clearChat(correctionId) {
+    this.run('DELETE FROM chat_messages WHERE correction_id = ?', [correctionId]);
+  }
+
+  // ---------- File d'attente ----------
+  addJob({ title, payloadFile, consigne = '', folderId = null }) {
+    return this.run('INSERT INTO jobs (title, status, payload_file, consigne, folder_id, created_at) VALUES (?, ?, ?, ?, ?, ?)', [title, 'pending', payloadFile, consigne, folderId, now()]);
+  }
+
+  listJobs() {
+    return this.all("SELECT j.*, c.score, c.grade, c.grade_max FROM jobs j LEFT JOIN corrections c ON c.id = j.correction_id ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, j.id DESC LIMIT 300");
+  }
+
+  getJob(id) {
+    return this.get('SELECT * FROM jobs WHERE id = ?', [id]);
+  }
+
+  nextJob() {
+    return this.get("SELECT * FROM jobs WHERE status = 'pending' ORDER BY id ASC LIMIT 1");
+  }
+
+  updateJob(id, patch) {
+    const cols = Object.keys(patch);
+    if (!cols.length) return;
+    this.run(`UPDATE jobs SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`, [...cols.map((c) => patch[c]), id]);
+  }
+
+  /** Au démarrage : une tâche interrompue par la fermeture de l'application reprend. */
+  resumeJobs() {
+    this.run("UPDATE jobs SET status = 'pending', progress = 'Reprise après redémarrage' WHERE status = 'running'");
+  }
+
+  deleteJob(id) {
+    this.run('DELETE FROM jobs WHERE id = ?', [id]);
+  }
+
+  clearFinishedJobs() {
+    const rows = this.all("SELECT payload_file FROM jobs WHERE status IN ('done', 'cancelled')");
+    this.run("DELETE FROM jobs WHERE status IN ('done', 'cancelled')");
+    return rows.map((r) => r.payload_file);
+  }
+
+  // ---------- Réinitialisation ----------
+  /** Efface toutes les données de cette installation (le fichier reste, vide). */
+  resetAll() {
+    this.x('DELETE FROM chat_messages');
+    this.x('DELETE FROM jobs');
+    this.x('DELETE FROM flashcards');
+    this.x('DELETE FROM exercises');
+    this.x('DELETE FROM corrections');
+    this.x('DELETE FROM folders');
+    this.x("DELETE FROM sqlite_sequence WHERE name IN ('chat_messages', 'jobs', 'flashcards', 'exercises', 'corrections', 'folders')");
+    this.persist();
+  }
+
   // ---------- Sauvegarde / fusion ----------
   exportAll() {
     return {
@@ -434,7 +538,8 @@ class Database {
       folders: this.all('SELECT * FROM folders'),
       corrections: this.all('SELECT * FROM corrections'),
       flashcards: this.all('SELECT * FROM flashcards'),
-      exercises: this.all('SELECT * FROM exercises')
+      exercises: this.all('SELECT * FROM exercises'),
+      chat: this.all('SELECT m.*, c.uuid AS correction_uuid FROM chat_messages m JOIN corrections c ON c.id = m.correction_id')
     };
   }
 
@@ -479,9 +584,9 @@ class Database {
         }
         continue;
       }
-      this.x(`INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.uuid || uuid(), c.name, folderId, c.created_at, c.updated_at || c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.consigne, c.result, c.sources, c.model, c.search_text, c.kind || 'correction']);
+      this.x(`INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, pages, annotations)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [c.uuid || uuid(), c.name, folderId, c.created_at, c.updated_at || c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.consigne, c.result, c.sources, c.model, c.search_text, c.kind || 'correction', c.pages, c.annotations]);
       corrMap[c.id] = this.get('SELECT last_insert_rowid() AS id').id;
       stats.corrections++;
     }
@@ -512,6 +617,12 @@ class Database {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [e.uuid || uuid(), e.title, e.subject, e.exercise_type, e.language, e.notions, e.statement, e.answer_format, e.difficulty, corrMap[e.source_correction_id] ?? null, corrMap[e.done_correction_id] ?? null, e.draft, e.created_at, e.updated_at || e.created_at]);
       stats.exercises++;
+    }
+    for (const m of data.chat || []) {
+      if (m.uuid && this.get('SELECT id FROM chat_messages WHERE uuid = ?', [m.uuid])) continue;
+      const cid = this.get('SELECT id FROM corrections WHERE uuid = ?', [m.correction_uuid])?.id;
+      if (!cid) continue;
+      this.x('INSERT INTO chat_messages (uuid, correction_id, role, content, model, created_at) VALUES (?, ?, ?, ?, ?, ?)', [m.uuid || uuid(), cid, m.role, m.content, m.model, m.created_at]);
     }
     this.persist(true);
     return stats;

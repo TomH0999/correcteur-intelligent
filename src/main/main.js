@@ -1,5 +1,6 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu, Notification } = require('electron');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
@@ -11,9 +12,12 @@ if (!app.isPackaged && !app.commandLine.hasSwitch('user-data-dir')) {
 const { extractFile } = require('./extractors');
 const { Database } = require('./db');
 const { Settings } = require('./settings');
-const { correct, recorrect, buildName, generateFlashcards, generateExercise } = require('./corrector');
+const { correct, recorrect, buildName, generateFlashcards, generateExercise, chatAbout, locateFaultsOnImage } = require('./corrector');
+const pages = require('./pages');
+const { Queue } = require('./queue');
 const { createProvider, PROVIDERS } = require('./providers');
 const { ModelResolver } = require('./models');
+const { LimitBook } = require('./limits');
 const { toMarkdown } = require('./report');
 const runner = require('./runner');
 const ocr = require('./ocr');
@@ -25,6 +29,9 @@ let win;
 let db;
 let settings;
 let resolver;
+let book;
+let queue;
+let dataDir;
 let currentAbort = null;
 let syncTimer = null;
 
@@ -74,7 +81,7 @@ function handle(channel, fn) {
 
 function providerFor(id) {
   const prefs = settings.prefs;
-  return createProvider(id, settings.getKey(id), { baseUrl: id === 'ollama' ? prefs.ollamaUrl || undefined : undefined });
+  return createProvider(id, settings.getKey(id), { book, baseUrl: id === 'ollama' ? prefs.ollamaUrl || undefined : undefined });
 }
 
 /** Prépare le fournisseur et les modèles réellement disponibles sur le compte. */
@@ -104,14 +111,27 @@ async function buildContext({ needVision = false, needAudio = false, progress = 
       } catch { /* suivant */ }
     }
   }
-  return { ai, audioAi, models: { main: corr.main, fallbacks: corr.fallbacks, vision, audio }, s, progress, signal, notes, ocr: ocr.ocrImage };
+  return { ai, audioAi, models: { main: corr.main, fallbacks: corr.fallbacks, vision, audio }, limits: (model) => book.limits(s.provider, model), s, progress, signal, notes, ocr: ocr.ocrImage };
 }
 
 const hasType = (files, t) => files.some((f) => f.parts.some((p) => p.type === t));
 
-async function saveAndCards(out, { files, consigne, kind = 'correction', exerciseId = null, folderId = null, nameSuffix = '' }) {
+async function saveAndCards(out, { files, consigne, kind = 'correction', exerciseId = null, folderId = null, nameSuffix = '', previews = [], pagesList = null }) {
   const now = new Date();
+  const uuid = crypto.randomUUID();
+  // Aperçus des pages de la copie (pour l'affichage annoté), enregistrés sur le disque
+  let savedPages = pagesList;
+  if (!savedPages) {
+    try {
+      savedPages = pages.savePages(dataDir, uuid, previews);
+    } catch (err) {
+      console.warn('Pages :', err.message);
+      savedPages = [];
+    }
+  }
   const id = db.saveCorrection({
+    uuid,
+    pages: savedPages,
     name: buildName(out.result, now) + nameSuffix,
     createdAt: now.toISOString(),
     folderId,
@@ -138,10 +158,33 @@ function autoFlashcards(ctx, id, result) {
     .catch((err) => console.warn('Fiches de révision :', err.message));
 }
 
+/** Une correction complète (utilisée par le bouton « Corriger » et par la file d'attente). */
+async function runCorrectionTask({ files, consigne = '', previews = [], folderId = null }, { progress, signal }) {
+  const ctx = await buildContext({ needVision: hasType(files, 'image'), needAudio: hasType(files, 'audio'), progress, signal });
+  const out = await correct(ctx, { files, consigne, runCode: runner.runCode });
+  progress({ step: 'save', message: 'Enregistrement dans l\'historique…' });
+  const id = await saveAndCards(out, { files: files.map((f) => ({ name: f.name, role: f.role || 'auto' })), consigne, previews, folderId });
+  autoFlashcards(ctx, id, out.result);
+  return { id, warnings: out.warnings };
+}
+
+function notifyDesktop(title, body, onClick) {
+  try {
+    if (!Notification.isSupported() || win?.isFocused()) return;
+    const n = new Notification({ title, body, icon: path.join(__dirname, '..', '..', 'build', 'icon.png') });
+    n.on('click', () => {
+      win?.show();
+      win?.focus();
+      onClick?.();
+    });
+    n.show();
+  } catch { /* ignore */ }
+}
+
 function scheduleSync() {
   if (!settings.get('syncDir')) return;
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => backup.syncFolder(db, settings, app.getVersion(), { pullOthers: false }).catch((err) => send('sync:status', { error: err.message })), 5000);
+  syncTimer = setTimeout(() => backup.syncFolder(db, settings, app.getVersion(), { pullOthers: false, dataDir }).catch((err) => send('sync:status', { error: err.message })), 5000);
 }
 
 function registerIpc() {
@@ -159,18 +202,69 @@ function registerIpc() {
   // ---- Correction ----
   const progress = (data) => send('correct:progress', data);
 
-  handle('correct:run', async ({ files, consigne }) => {
+  handle('correct:run', async ({ files, consigne, previews }) => {
     currentAbort = new AbortController();
     try {
-      const ctx = await buildContext({ needVision: hasType(files, 'image'), needAudio: hasType(files, 'audio'), progress, signal: currentAbort.signal });
-      const out = await correct(ctx, { files, consigne, runCode: runner.runCode });
-      progress({ step: 'save', message: 'Enregistrement dans l\'historique…' });
-      const id = await saveAndCards(out, { files: files.map((f) => ({ name: f.name, role: f.role || 'auto' })), consigne });
-      autoFlashcards(ctx, id, out.result);
-      return { id, warnings: out.warnings };
+      return await runCorrectionTask({ files, consigne, previews }, { progress, signal: currentAbort.signal });
     } finally {
       currentAbort = null;
     }
+  });
+
+  // ---- File d'attente ----
+  handle('queue:add', (jobs) => jobs.map((j) => queue.enqueue(j)));
+  handle('queue:list', () => queue.list());
+  handle('queue:cancel', (id) => queue.cancel(id));
+  handle('queue:retry', (id) => queue.retry(id));
+  handle('queue:remove', (id) => queue.remove(id));
+  handle('queue:clear', () => queue.clearFinished());
+  handle('queue:pause', (p) => queue.setPaused(p));
+
+  // ---- Discussion avec l'IA ----
+  handle('chat:list', (correctionId) => db.listChat(correctionId));
+  handle('chat:clear', (correctionId) => db.clearChat(correctionId));
+  handle('chat:send', async (correctionId, text) => {
+    const rec = db.getCorrection(correctionId);
+    if (!rec) throw new Error('Correction introuvable.');
+    const question = String(text || '').trim();
+    if (!question) throw new Error('Message vide.');
+    const history = db.listChat(correctionId);
+    db.addChat(correctionId, 'user', question);
+    try {
+      const ctx = await buildContext({ progress: (p) => send('chat:progress', { correctionId, message: p.message }) });
+      const r = await chatAbout(ctx, rec, history, question);
+      db.addChat(correctionId, 'assistant', r.content, r.model);
+    } catch (err) {
+      db.addChat(correctionId, 'error', `Réponse impossible : ${err.message}`);
+    }
+    return db.listChat(correctionId);
+  });
+
+  // ---- Copie annotée ----
+  handle('page:read', (rel) => `data:image/jpeg;base64,${pages.readPage(dataDir, rel)}`);
+  handle('annotate:locate', async (correctionId) => {
+    const rec = db.getCorrection(correctionId);
+    if (!rec) throw new Error('Correction introuvable.');
+    const fautes = rec.result.fautes;
+    if (!fautes.length) return [];
+    const answerFiles = new Set(rec.result.identification?.reponses || []);
+    // Pages sans texte exploitable (photos, scans) : localisation par le modèle de vision
+    const targets = rec.pages.filter((p) => !p.items?.length && (!answerFiles.size || answerFiles.has(p.file) || [...answerFiles].some((f) => p.label.includes(f))));
+    if (!targets.length) return rec.annotations || [];
+    const ctx = await buildContext({ needVision: true, progress: (p) => send('annotate:progress', { correctionId, message: p.message }) });
+    const out = (rec.annotations || []).filter((a) => !targets.some((t) => t.id === a.page));
+    for (const [i, pg] of targets.entries()) {
+      send('annotate:progress', { correctionId, message: `Localisation des fautes sur la page ${i + 1}/${targets.length}…` });
+      try {
+        const found = await locateFaultsOnImage(ctx, pages.readPage(dataDir, pg.img), fautes);
+        for (const a of found) out.push({ page: pg.id, faute: a.faute, boxes: a.boxes, source: 'vision' });
+      } catch (err) {
+        if (err.status === 401) throw err;
+        send('annotate:progress', { correctionId, message: `Page ${i + 1} : ${err.message}` });
+      }
+    }
+    db.setAnnotations(correctionId, out);
+    return out;
   });
 
   handle('correct:rerun', async (id) => {
@@ -180,7 +274,7 @@ function registerIpc() {
     try {
       const ctx = await buildContext({ progress, signal: currentAbort.signal });
       const out = await recorrect(ctx, { sources: rec.sources, consigne: rec.consigne, runCode: runner.runCode });
-      const newId = await saveAndCards(out, { files: rec.files, consigne: rec.consigne, folderId: rec.folder_id, kind: rec.kind, exerciseId: rec.exercise_id, nameSuffix: ' (re-correction)' });
+      const newId = await saveAndCards(out, { files: rec.files, consigne: rec.consigne, folderId: rec.folder_id, kind: rec.kind, exerciseId: rec.exercise_id, nameSuffix: ' (re-correction)', pagesList: rec.pages });
       return { id: newId, warnings: out.warnings };
     } finally {
       currentAbort = null;
@@ -215,7 +309,13 @@ function registerIpc() {
   handle('db:list', (q) => db.listCorrections(q || {}));
   handle('db:get', (id) => db.getCorrection(id));
   handle('db:update', (id, patch) => db.updateCorrection(id, patch));
-  handle('db:delete', (id) => db.deleteCorrection(id));
+  handle('db:delete', (id) => {
+    const rec = db.getCorrection(id);
+    db.deleteCorrection(id);
+    // Images de la copie supprimées si plus aucune correction ne les utilise (re-corrections)
+    const dir = rec?.pages?.[0]?.img?.split('/')[1];
+    if (dir && !db.get('SELECT id FROM corrections WHERE pages LIKE ?', [`%pages/${dir}/%`])) pages.deletePages(dataDir, dir);
+  });
   handle('db:stats', () => db.stats());
   handle('db:dashboard', () => db.dashboard());
 
@@ -244,7 +344,7 @@ function registerIpc() {
   handle('ex:get', (id) => db.getExercise(id));
   handle('ex:update', (id, patch) => db.updateExercise(id, patch));
   handle('ex:delete', (id) => db.deleteExercise(id));
-  handle('ex:submit', async ({ id, answer, files = [] }) => {
+  handle('ex:submit', async ({ id, answer, files = [], previews = [] }) => {
     const ex = db.getExercise(id);
     if (!ex) throw new Error('Exercice introuvable.');
     const all = [
@@ -256,7 +356,7 @@ function registerIpc() {
     try {
       const ctx = await buildContext({ needVision: hasType(all, 'image'), needAudio: hasType(all, 'audio'), progress, signal: currentAbort.signal });
       const out = await correct(ctx, { files: all, consigne: 'Exercice d\'entraînement généré par l\'application.', runCode: runner.runCode });
-      const cid = await saveAndCards(out, { files: all.map((f) => ({ name: f.name, role: f.role })), consigne: '', kind: 'practice', exerciseId: id, nameSuffix: ' (entraînement)' });
+      const cid = await saveAndCards(out, { files: all.map((f) => ({ name: f.name, role: f.role })), consigne: '', kind: 'practice', exerciseId: id, nameSuffix: ' (entraînement)', previews });
       db.updateExercise(id, { doneCorrectionId: cid, draft: answer || '' });
       autoFlashcards(ctx, cid, out.result);
       return { id: cid, warnings: out.warnings };
@@ -289,22 +389,46 @@ function registerIpc() {
     const d = new Date().toISOString().slice(0, 10);
     const r = await dialog.showSaveDialog(win, { defaultPath: `Sauvegarde-Correcteur-${d}${backup.EXT}`, filters: [{ name: 'Sauvegarde Correcteur Intelligent', extensions: [backup.EXT.slice(1)] }] });
     if (r.canceled) return false;
-    fs.writeFileSync(r.filePath, await backup.buildBackup(db, settings, app.getVersion()));
+    fs.writeFileSync(r.filePath, await backup.buildBackup(db, settings, app.getVersion(), { dataDir }));
     return r.filePath;
   });
   handle('backup:import', async (mode = 'merge') => {
     const r = await dialog.showOpenDialog(win, { title: 'Importer une sauvegarde', properties: ['openFile'], filters: [{ name: 'Sauvegarde', extensions: [backup.EXT.slice(1), 'sqlite', 'zip'] }] });
     if (r.canceled) return false;
-    return backup.importBackup(db, fs.readFileSync(r.filePaths[0]), { mode });
+    if (mode === 'replace') await backup.autoBackup(db, settings, app.getVersion(), dataDir, 'avant-restauration');
+    return backup.importBackup(db, fs.readFileSync(r.filePaths[0]), { mode, dataDir });
+  });
+  handle('backup:listAuto', () => backup.listAutoBackups(dataDir));
+  handle('backup:restoreAuto', async (file) => {
+    const item = backup.listAutoBackups(dataDir).find((b) => b.file === file);
+    if (!item) throw new Error('Sauvegarde introuvable.');
+    await backup.autoBackup(db, settings, app.getVersion(), dataDir, 'avant-restauration');
+    return backup.importBackup(db, fs.readFileSync(item.path), { mode: 'replace', dataDir });
+  });
+  handle('backup:openDir', () => shell.openPath(path.join(dataDir, 'backups')));
+
+  // ---- Réinitialisation (avec sauvegarde automatique préalable) ----
+  handle('app:reset', async ({ data = true, prefs = false, keys = false } = {}) => {
+    const saved = await backup.autoBackup(db, settings, app.getVersion(), dataDir, 'avant-reinitialisation');
+    if (data) {
+      currentAbort?.abort();
+      queue.setPaused(true);
+      for (const f of db.listJobs()) queue.remove(f.id);
+      db.resetAll();
+      fs.rmSync(path.join(dataDir, 'pages'), { recursive: true, force: true });
+      queue.setPaused(false);
+    }
+    settings.reset({ prefs, keys });
+    return { backup: saved, settings: settings.public() };
   });
   handle('sync:chooseDir', async () => {
     const r = await dialog.showOpenDialog(win, { title: 'Dossier synchronisé (OneDrive, Google Drive, Dropbox…)', properties: ['openDirectory', 'createDirectory'] });
     if (r.canceled) return settings.public();
     settings.update({ syncDir: r.filePaths[0] });
-    await backup.syncFolder(db, settings, app.getVersion());
+    await backup.syncFolder(db, settings, app.getVersion(), { dataDir });
     return settings.public();
   });
-  handle('sync:now', () => backup.syncFolder(db, settings, app.getVersion()));
+  handle('sync:now', () => backup.syncFolder(db, settings, app.getVersion(), { dataDir }));
   handle('sync:disable', () => settings.update({ syncDir: '' }));
 
   // ---- Téléphone (QR code) ----
@@ -329,7 +453,7 @@ function registerIpc() {
     return settings.public();
   });
   handle('settings:testKey', async (provider, key) => {
-    const p = createProvider(provider, String(key || settings.getKey(provider) || '').trim(), { baseUrl: provider === 'ollama' ? settings.prefs.ollamaUrl || undefined : undefined });
+    const p = createProvider(provider, String(key || settings.getKey(provider) || '').trim(), { book, baseUrl: provider === 'ollama' ? settings.prefs.ollamaUrl || undefined : undefined });
     const models = await p.listModels();
     return { ok: true, count: models.length };
   });
@@ -357,18 +481,42 @@ if (!gotLock) {
     }
   });
 
+  if (process.platform === 'win32') app.setAppUserModelId('fr.tomh0999.correcteur-intelligent');
   app.whenReady().then(async () => {
-    const dataDir = app.getPath('userData');
+    dataDir = app.getPath('userData');
     settings = new Settings(path.join(dataDir, 'settings.json'), safeStorage);
     resolver = new ModelResolver(settings.modelStore());
+    book = new LimitBook(settings.limitStore());
     db = await new Database(path.join(dataDir, 'corrections.sqlite'), { onChange: scheduleSync }).open();
     registerIpc();
     if (app.isPackaged) Menu.setApplicationMenu(null);
     createWindow();
-    updater.init({ notify: (s) => send('update:status', s), enabled: settings.public().autoUpdate });
+    updater.init({
+      notify: (s) => send('update:status', s),
+      enabled: settings.public().autoUpdate,
+      onBeforeInstall: () => backup.autoBackup(db, settings, app.getVersion(), dataDir, 'avant-mise-a-jour')
+    });
+    // Sauvegarde automatique quotidienne (protège les données en cas de problème)
+    const today = new Date().toISOString().slice(0, 10);
+    if (settings.get('lastAutoBackup') !== today && db.stats().total) {
+      backup.autoBackup(db, settings, app.getVersion(), dataDir, 'quotidienne').then(() => settings.set('lastAutoBackup', today)).catch((err) => console.warn('Sauvegarde auto :', err.message));
+    }
+    // File d'attente : reprise des corrections interrompues
+    queue = new Queue({
+      db,
+      dataDir,
+      isBusy: () => !!currentAbort,
+      run: (job, payload, opts) => runCorrectionTask({ ...payload, folderId: job.folder_id }, opts),
+      notify: (ev) => {
+        send('queue:update', ev);
+        if (ev.done) notifyDesktop('Correction terminée', ev.done.title, () => send('nav:result', ev.done.correctionId));
+        if (ev.failed) notifyDesktop('Correction en échec', `${ev.failed.title} : ${ev.failed.error}`);
+      }
+    });
+    queue.resume();
     // Synchronisation au démarrage (récupère les corrections faites sur les autres PC)
     if (settings.get('syncDir')) {
-      backup.syncFolder(db, settings, app.getVersion()).then((s) => s && send('sync:status', s)).catch((err) => send('sync:status', { error: err.message }));
+      backup.syncFolder(db, settings, app.getVersion(), { dataDir }).then((s) => s && send('sync:status', s)).catch((err) => send('sync:status', { error: err.message }));
     }
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

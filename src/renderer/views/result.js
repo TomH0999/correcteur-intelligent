@@ -23,6 +23,8 @@ function render(root, rec) {
       <div class="spacer"></div>
       <button class="btn sm" id="r-folder"><i class="fa-solid fa-folder${folderName ? '' : '-plus'}" style="color:var(--amber)"></i>${folderName ? esc(folderName) : 'Enregistrer dans un dossier'}</button>
       <button class="btn sm" id="r-rename"><i class="fa-solid fa-pen"></i>Renommer</button>
+      <button class="btn sm" id="r-annot"><i class="fa-solid fa-highlighter"></i>Copie annotée</button>
+      <button class="btn sm" id="r-chat"><i class="fa-solid fa-comments"></i>Discuter</button>
       <button class="btn sm" id="r-train"><i class="fa-solid fa-dumbbell"></i>S'entraîner</button>
       <button class="btn sm" id="r-cards"><i class="fa-solid fa-layer-group"></i>Fiches</button>
       <button class="btn sm" id="r-compare"><i class="fa-solid fa-code-compare"></i>Comparer</button>
@@ -60,7 +62,7 @@ function render(root, rec) {
     <nav class="tabs no-print">
       <a href="#sec-synthese">Synthèse</a><a href="#sec-questions">Questions</a><a href="#sec-fautes">Fautes (${r.fautes.length})</a>
       ${ex.length ? '<a href="#sec-exec">Exécution du code</a>' : ''}
-      <a href="#sec-ameliorations">Améliorations</a><a href="#sec-revoir">À revoir</a><a href="#sec-modele">Correction modèle</a><a href="#sec-sources">Documents lus</a>
+      <a href="#sec-ameliorations">Améliorations</a><a href="#sec-revoir">À revoir</a><a href="#sec-modele">Correction modèle</a><a href="#sec-chat">Discuter avec l'IA</a><a href="#sec-sources">Documents lus</a>
     </nav>
 
     <section class="card" id="sec-synthese">
@@ -145,6 +147,19 @@ function render(root, rec) {
       <div class="md" data-md="modele"></div>
     </section>
 
+    <section class="card no-print" id="sec-chat">
+      <div class="row between"><h2 style="margin:0"><i class="fa-solid fa-comments"></i>Discuter avec l'IA de cette correction</h2><button class="btn sm ghost" id="chat-clear"><i class="fa-solid fa-eraser"></i>Effacer</button></div>
+      <p class="small muted">Pose tes questions : l'IA connaît ta copie, la correction et les résultats des tests.</p>
+      <div class="chat-log" id="chat-log"></div>
+      <div class="row wrap" id="chat-suggest" style="margin:10px 0">
+        ${['Explique-moi ma faute la plus grave', 'Pourquoi j\'ai perdu des points ?', 'Donne-moi un exercice similaire', 'Comment éviter ces erreurs à l\'examen ?'].map((t) => `<button class="btn sm" data-suggest="${esc(t)}">${esc(t)}</button>`).join('')}
+      </div>
+      <div class="chat-input">
+        <textarea id="chat-text" rows="2" placeholder="Ta question… (Entrée pour envoyer, Maj+Entrée pour aller à la ligne)"></textarea>
+        <button class="btn primary" id="chat-send"><i class="fa-solid fa-paper-plane"></i></button>
+      </div>
+    </section>
+
     <section class="card no-print" id="sec-sources">
       <h2><i class="fa-solid fa-eye"></i>Documents lus par l'IA</h2>
       <p class="small muted" style="margin-top:-6px">Texte extrait et transcription des images : vérifie qu'un manuscrit a bien été déchiffré.</p>
@@ -181,6 +196,9 @@ function bind(root, rec) {
     go('result', { id: rec.id });
   };
   $('#r-train', root).onclick = () => go('training', { fromCorrection: rec });
+  $('#r-annot', root).onclick = () => go('annotate', { id: rec.id });
+  $('#r-chat', root).onclick = () => { $('#sec-chat', root).scrollIntoView({ behavior: 'smooth' }); $('#chat-text', root).focus(); };
+  initChat(root, rec);
   $('#r-cards', root).onclick = async (e) => {
     const btn = e.currentTarget;
     const existing = await api.cards({ correctionId: rec.id });
@@ -232,6 +250,61 @@ function bind(root, rec) {
     $(a.getAttribute('href'), root).scrollIntoView({ behavior: 'smooth', block: 'start' });
   }));
   void r;
+}
+
+// ---------- Discussion avec l'IA ----------
+function drawChat(root, msgs) {
+  const log = $('#chat-log', root);
+  log.innerHTML = msgs.length ? msgs.map((m) => `
+    <div class="chat-msg ${m.role}">
+      <div class="chat-who">${m.role === 'user' ? '<i class="fa-solid fa-user"></i> Toi' : m.role === 'error' ? '<i class="fa-solid fa-triangle-exclamation"></i> Erreur' : '<i class="fa-solid fa-robot"></i> Tuteur IA'}</div>
+      <div class="md" data-chat="${m.id}"></div>
+    </div>`).join('') : '<div class="small dim" style="text-align:center;padding:12px">Aucun message pour l\'instant.</div>';
+  for (const m of msgs) setMd($(`[data-chat="${m.id}"]`, log), m.content);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function initChat(root, rec) {
+  let msgs = await api.chatList(rec.id);
+  drawChat(root, msgs);
+  const input = $('#chat-text', root);
+  const btn = $('#chat-send', root);
+  const sendMsg = async (text) => {
+    const t = String(text || '').trim();
+    if (!t || btn.disabled) return;
+    btn.disabled = true;
+    input.value = '';
+    drawChat(root, [...msgs, { id: 'tmp', role: 'user', content: t }, { id: 'wait', role: 'assistant', content: '_Réflexion en cours…_' }]);
+    const off = api.onChatProgress((p) => {
+      const w = $('[data-chat="wait"]', root);
+      if (p.correctionId === rec.id && w) w.textContent = p.message;
+    });
+    try {
+      msgs = await api.chatSend(rec.id, t);
+      drawChat(root, msgs);
+    } catch (err) {
+      toast(err.message, 'error', 8000);
+      drawChat(root, msgs);
+    } finally {
+      off();
+      btn.disabled = false;
+      input.focus();
+    }
+  };
+  btn.onclick = () => sendMsg(input.value);
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMsg(input.value);
+    }
+  };
+  $$('[data-suggest]', root).forEach((b) => (b.onclick = () => sendMsg(b.dataset.suggest)));
+  $('#chat-clear', root).onclick = async () => {
+    if (!msgs.length || !(await confirmBox('Effacer la discussion', 'Effacer tous les messages de cette discussion ?', 'Effacer'))) return;
+    await api.chatClear(rec.id);
+    msgs = [];
+    drawChat(root, msgs);
+  };
 }
 
 async function chooseFolder(rec) {

@@ -32,6 +32,11 @@ class Settings {
       }
       this.data.prefsVersion = 2;
     }
+    // v1.2 : la taille max devient la taille totale analysée (la correction découpée gère les gros devoirs)
+    if (this.data.prefsVersion < 3) {
+      if (this.data.prefs && (!this.data.prefs.maxInputChars || this.data.prefs.maxInputChars <= 60000)) delete this.data.prefs.maxInputChars;
+      this.data.prefsVersion = 3;
+    }
     if (!this.data.installId) {
       this.data.installId = crypto.randomUUID();
       this.data.installedAt = new Date().toISOString();
@@ -110,6 +115,19 @@ class Settings {
     return this.public();
   }
 
+  /** Réinitialisation : réglages et/ou clés API (l'identifiant d'installation est conservé). */
+  reset({ prefs = false, keys = false } = {}) {
+    if (prefs) {
+      this.data.prefs = {};
+      delete this.data.modelCache;
+      delete this.data.modelLimits;
+      delete this.data.syncDir;
+      delete this.data.lastSyncAt;
+    }
+    if (keys) this.data.keys = {};
+    this.save();
+  }
+
   set(key, value) {
     this.data[key] = value;
     this.save();
@@ -117,6 +135,11 @@ class Settings {
 
   get(key) {
     return this.data[key];
+  }
+
+  /** Limites apprises des modèles (contexte, sortie max, jetons/minute). */
+  limitStore() {
+    return { get: () => this.data.modelLimits || {}, set: (c) => { this.data.modelLimits = c; this.save(); } };
   }
 
   /** Cache des modèles disponibles (par fournisseur) pour ModelResolver. */

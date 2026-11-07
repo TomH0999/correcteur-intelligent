@@ -51,7 +51,10 @@ export function toast(msg, type = 'ok', ms = 4000, action = null) {
     b.onclick = () => { action.onClick(); el.remove(); };
     el.appendChild(b);
   }
-  $('#toasts').appendChild(el);
+  const box = $('#toasts');
+  box.appendChild(el);
+  // Au plus 4 notifications visibles
+  while (box.children.length > 4) box.firstElementChild.remove();
   setTimeout(() => el.classList.add('out'), ms);
   setTimeout(() => el.remove(), ms + 400);
 }
@@ -87,7 +90,7 @@ export function modal({ title, icon = 'fa-pen', body, okLabel = 'OK', danger = f
     m.onclick = (e) => { if (e.target === m) close(null); };
     m.onkeydown = (e) => {
       if (e.key === 'Escape') close(null);
-      if (e.key === 'Enter' && e.target.tagName === 'INPUT') close(b);
+      if (e.key === 'Enter' && e.target.tagName === 'INPUT' && !ok.disabled) close(b);
     };
   });
 }

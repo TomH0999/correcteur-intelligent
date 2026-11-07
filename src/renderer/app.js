@@ -7,6 +7,8 @@ import './views/result.js';
 import './views/lists.js';
 import './views/dashboard.js';
 import './views/practice.js';
+import './views/annotate.js';
+import { initQueue } from './views/queue.js';
 import { updateStatusText } from './views/settings.js';
 
 function updatePill(u) {
@@ -64,6 +66,8 @@ async function init() {
     }
   });
   await refreshStats();
+  await initQueue();
+  api.onNavResult((id) => go('result', { id }));
   // Premier lancement : on guide vers la clé API
   go(state.settings.hasApiKey ? 'new' : 'settings');
   if (!state.settings.hasApiKey) toast('Bienvenue ! Commence par ajouter une clé API (Groq est gratuit).', 'info', 8000);

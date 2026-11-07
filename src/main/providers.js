@@ -75,16 +75,20 @@ class AIError extends Error {
   }
 }
 
+const { LimitBook, estimateMessages, limitsFromError } = require('./limits');
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const defaultBook = new LimitBook();
 
 // ---------------------------------------------------------------- OpenAI-compatible (Groq, OpenAI, Gemini, Ollama)
 class OpenAICompatible {
-  constructor(id, apiKey, { fetchImpl, baseUrl } = {}) {
+  constructor(id, apiKey, { fetchImpl, baseUrl, book } = {}) {
     this.id = id;
     this.p = PROVIDERS[id];
     this.apiKey = apiKey;
     this.baseUrl = (baseUrl || this.p.baseUrl).replace(/\/$/, '');
     this.fetch = fetchImpl || globalThis.fetch;
+    this.book = book || defaultBook;
   }
 
   async request(endpoint, init, { retries = 4, signal } = {}) {
@@ -103,7 +107,10 @@ class OpenAICompatible {
         const local = this.p.local ? ' Vérifie qu\'Ollama est lancé sur ce PC.' : ' Vérifie ta connexion internet.';
         throw new AIError(`Impossible de joindre ${this.p.label} (${err.message}).${local}`, 0, 'network');
       }
-      if (res.ok) return res.json();
+      if (res.ok) {
+        if (init.model) this.book.fromHeaders(this.id, init.model, res.headers);
+        return res.json();
+      }
       const text = await res.text();
       let body;
       try { body = JSON.parse(text); } catch { body = { error: { message: text } }; }
@@ -125,6 +132,10 @@ class OpenAICompatible {
         }
       }
       if (res.status === 429 && tooBigForLimit) err.code = 'tokens per minute';
+      if (init.model) {
+        const learned = limitsFromError(msg);
+        if (Object.keys(learned).length) this.book.learn(this.id, init.model, { ...learned, fromError: true });
+      }
       if (res.status === 401 || res.status === 403) err.message = `Clé API ${this.p.label} invalide, expirée ou sans accès (${msg}). Vérifie-la dans les Paramètres.`;
       throw err;
     }
@@ -137,7 +148,10 @@ class OpenAICompatible {
       : { type: 'text', text: c.text }));
   }
 
-  async chat({ model, system, messages, json = false, maxTokens = 8192, effort, signal, temperature = 0.2 }) {
+  async chat({ model, system, messages, json = false, maxTokens = 8192, effort, signal, temperature = 0.2, onWait }) {
+    // Jamais plus que la sortie maximale connue du modèle
+    maxTokens = Math.max(16, Math.min(maxTokens, this.book.limits(this.id, model).maxOut));
+    await this.book.waitFor(this.id, model, estimateMessages(system, messages) + maxTokens, { onWait, signal });
     const msgs = [];
     if (system) msgs.push({ role: 'system', content: system });
     for (const m of messages) msgs.push({ role: m.role, content: OpenAICompatible.toOpenAIContent(m.content) });
@@ -150,13 +164,13 @@ class OpenAICompatible {
     if (effort && /gpt-oss/.test(model)) body.reasoning_effort = effort;
     let data;
     try {
-      data = await this.request('/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, { signal });
+      data = await this.request('/chat/completions', { method: 'POST', model, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, { signal });
     } catch (err) {
       // Certains modèles n'acceptent pas le mode JSON ou reasoning_effort : nouvel essai sans
       if (err.status === 400 && (body.response_format || body.reasoning_effort) && /response_format|json|reasoning/i.test(err.message)) {
         delete body.response_format;
         delete body.reasoning_effort;
-        data = await this.request('/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, { signal });
+        data = await this.request('/chat/completions', { method: 'POST', model, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, { signal });
       } else throw err;
     }
     const choice = data.choices?.[0];
@@ -175,19 +189,24 @@ class OpenAICompatible {
 
   async listModels() {
     const data = await this.request('/models', { method: 'GET' }, { retries: 1 });
-    return (data.data || data.models || [])
-      .filter((m) => m.active !== false)
-      .map((m) => String(m.id || m.name || '').replace(/^models\//, ''))
-      .filter(Boolean)
-      .sort();
+    const list = (data.data || data.models || []).filter((m) => m.active !== false);
+    // Groq indique la fenêtre de contexte et la sortie maximale de chaque modèle
+    for (const m of list) {
+      const id = String(m.id || m.name || '').replace(/^models\//, '');
+      const context = Number(m.context_window || m.context_length || m.inputTokenLimit) || null;
+      const maxOut = Number(m.max_completion_tokens || m.max_output_tokens || m.outputTokenLimit) || null;
+      if (id && (context || maxOut)) this.book.learn(this.id, id, { context, maxOut });
+    }
+    return list.map((m) => String(m.id || m.name || '').replace(/^models\//, '')).filter(Boolean).sort();
   }
 }
 
 // ---------------------------------------------------------------- Anthropic (SDK officiel)
 class AnthropicProvider {
-  constructor(apiKey, { sdkClient } = {}) {
+  constructor(apiKey, { sdkClient, book } = {}) {
     this.id = 'anthropic';
     this.p = PROVIDERS.anthropic;
+    this.book = book || defaultBook;
     if (sdkClient) this.client = sdkClient;
     else {
       const mod = require('@anthropic-ai/sdk');
@@ -197,8 +216,12 @@ class AnthropicProvider {
     }
   }
 
-  wrap(err, signal) {
+  wrap(err, signal, model) {
     if (signal?.aborted) return new AIError('Correction annulée.', 0, 'aborted');
+    if (model) {
+      const learned = limitsFromError(err.error?.error?.message || err.message);
+      if (Object.keys(learned).length) this.book.learn('anthropic', model, { ...learned, fromError: true });
+    }
     const status = err.status || 0;
     const msg = err.error?.error?.message || err.message || String(err);
     const e = new AIError(msg, status, err.error?.error?.type || err.name || '');
@@ -216,7 +239,7 @@ class AnthropicProvider {
     }));
     const params = {
       model,
-      max_tokens: Math.max(maxTokens, 16000),
+      max_tokens: Math.min(Math.max(maxTokens, 16000), this.book.limits('anthropic', model).maxOut === 8192 ? 64000 : this.book.limits('anthropic', model).maxOut),
       ...(system ? { system } : {}),
       messages: msgs,
       // Effort : plus élevé = correction plus approfondie
@@ -239,9 +262,9 @@ class AnthropicProvider {
         try {
           res = await this.client.messages.stream(params, { signal }).finalMessage();
         } catch (err2) {
-          throw this.wrap(err2, signal);
+          throw this.wrap(err2, signal, model);
         }
-      } else throw this.wrap(err, signal);
+      } else throw this.wrap(err, signal, model);
     }
     if (res.stop_reason === 'refusal') {
       throw new AIError(`Le modèle a refusé la requête (${res.stop_details?.category || 'sécurité'}). Essaie un autre modèle.`, 400, 'refusal');
@@ -257,7 +280,10 @@ class AnthropicProvider {
   async listModels() {
     try {
       const ids = [];
-      for await (const m of this.client.models.list({ limit: 100 })) ids.push(m.id);
+      for await (const m of this.client.models.list({ limit: 100 })) {
+        ids.push(m.id);
+        if (m.max_input_tokens || m.max_tokens) this.book.learn('anthropic', m.id, { context: m.max_input_tokens || null, maxOut: m.max_tokens || null });
+      }
       return ids.sort();
     } catch (err) {
       throw this.wrap(err);
@@ -273,4 +299,4 @@ function createProvider(id, apiKey, opts = {}) {
   return new OpenAICompatible(id, apiKey, opts);
 }
 
-module.exports = { PROVIDERS, AIError, createProvider, OpenAICompatible, AnthropicProvider };
+module.exports = { PROVIDERS, AIError, createProvider, OpenAICompatible, AnthropicProvider, defaultBook };

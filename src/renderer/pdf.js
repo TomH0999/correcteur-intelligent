@@ -60,6 +60,31 @@ async function renderPage(page, maxSide = 1700) {
   return dataUrl.split(',')[1];
 }
 
+const MAX_PREVIEWS = 40;
+const r4 = (v) => Math.round(v * 10000) / 10000;
+
+/** Aperçu de page pour la copie annotée : image + position des mots (coordonnées 0–1). */
+async function pagePreview(page) {
+  const base = page.getViewport({ scale: 1 });
+  const scale = Math.min(2, 1400 / Math.max(base.width, base.height));
+  const vp = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(vp.width);
+  canvas.height = Math.round(vp.height);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  const content = await page.getTextContent();
+  const items = content.items.filter((it) => it.str && it.str.trim()).map((it) => {
+    const [x, y] = vp.convertToViewportPoint(it.transform[4], it.transform[5]);
+    const h = Math.hypot(it.transform[2], it.transform[3]) * scale;
+    const w = it.width * scale;
+    return [it.str, r4(x / vp.width), r4((y - h) / vp.height), r4(w / vp.width), r4((h * 1.15) / vp.height)];
+  });
+  return { base64: canvas.toDataURL('image/jpeg', 0.75).split(',')[1], w: canvas.width, h: canvas.height, items };
+}
+
 /**
  * @param {string} base64 contenu du PDF
  * @param {string} label nom du fichier
@@ -72,6 +97,7 @@ export async function processPdf(base64, label, mode = 'auto', onPage = () => {}
   const n = Math.min(doc.numPages, MAX_PAGES);
   if (doc.numPages > MAX_PAGES) warnings.push(`${label} : ${doc.numPages} pages, seules les ${MAX_PAGES} premières sont analysées.`);
   const parts = [];
+  const previews = [];
   let rendered = 0;
   for (let i = 1; i <= n; i++) {
     onPage(i, n);
@@ -91,10 +117,15 @@ export async function processPdf(base64, label, mode = 'auto', onPage = () => {}
         rendered++;
       }
     }
+    if (previews.length < MAX_PREVIEWS) {
+      try {
+        previews.push({ label: pageLabel, ...(await pagePreview(page)) });
+      } catch { /* aperçu facultatif */ }
+    }
     page.cleanup();
   }
   await doc.destroy();
-  return { parts, warnings, pages: n };
+  return { parts, warnings, pages: n, previews };
 }
 
 /** Redimensionne / normalise une image (JPEG ≤ 1800 px) pour la vision. */

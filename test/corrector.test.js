@@ -97,3 +97,67 @@ test('aucun modèle de vision : OCR local signalé', async () => {
   assert.equal(v.model, null);
   assert.match(v.notes[0], /OCR local/);
 });
+
+test('gros devoir + petit modèle (sortie max 4096, 8000 jetons/min) : correction découpée sans erreur', async () => {
+  const { LimitBook } = require('../src/main/limits');
+  const calls = [];
+  const json = (status, obj) => ({ ok: status < 300, status, statusText: '', headers: new Map(), json: async () => obj, text: async () => JSON.stringify(obj) });
+  const fetchImpl = async (url, init) => {
+    if (url.endsWith('/models')) return json(200, { data: [{ id: 'small-model', context_window: 131072, max_completion_tokens: 4096 }] });
+    const body = JSON.parse(init.body);
+    const sys = body.messages[0].content;
+    const user = body.messages[1].content;
+    if (body.max_completion_tokens > 4096) {
+      return json(400, { error: { message: '`max_completion_tokens` must be less than or equal to `4096`, the maximum value for `max_completion_tokens` is less than the `context_window` for this model', type: 'invalid_request_error' } });
+    }
+    const requested = Math.ceil((sys.length + user.length) / 4) + body.max_completion_tokens;
+    if (requested > 8000) {
+      return json(413, { error: { message: `Request too large for model \`small-model\` in organization on tokens per minute (TPM): Limit 8000, Requested ${requested}, please reduce your message size and try again.`, code: 'rate_limit_exceeded' } });
+    }
+    let content;
+    if (sys.includes('Découpe-le en segments')) {
+      // Chaque ligne « Question N » ouvre un segment d'énoncé, « Réponse N » un segment de réponse
+      const segs = [];
+      user.split('\n').forEach((l) => {
+        const m = l.match(/^L(\d+)\| (Question|Réponse) (\d+)/);
+        if (m) segs.push({ de: Number(m[1]), a: Number(m[1]), nature: m[2] === 'Question' ? 'enonce' : 'reponse', question: m[3] });
+      });
+      calls.push('index');
+      content = { segments: segs };
+    } else if (sys.includes('UNE PARTIE')) {
+      const nums = [...user.matchAll(/### Question (\d+)/g)].map((m) => m[1]);
+      calls.push(`lot:${nums.join(',')}`);
+      content = { questions: nums.map((n) => ({ numero: n, intitule: `Q${n}`, statut: 'correct', points_obtenus: 2, points_max: 2, commentaire: 'ok' })), fautes: [], correction_modele: `Corrigé ${nums.join(',')}` };
+    } else if (sys.includes('synthèse finale')) {
+      calls.push('synthese');
+      content = { titre: 'Gros devoir', matiere: 'Algo', type_exercice: 'algorithmique', resume: 'Bien.' };
+    } else {
+      calls.push('single');
+      content = { titre: 'x' };
+    }
+    return json(200, { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(content) } }] });
+  };
+  let limitsStore = {};
+  const book = new LimitBook({ get: () => limitsStore, set: (v) => { limitsStore = v; } });
+  const ai = createProvider('groq', 'k', { fetchImpl, book });
+  await ai.listModels();
+  // Énoncé et réponses volumineux : 12 questions de ~2 500 caractères chacune
+  const filler = (n) => ` ${'détail '.repeat(n)}`;
+  const enonce = Array.from({ length: 12 }, (_, i) => `Question ${i + 1} : écrire la fonction f${i + 1}.${filler(300)}`).join('\n');
+  const reponses = Array.from({ length: 12 }, (_, i) => `Réponse ${i + 1} : def f${i + 1}(): pass${filler(300)}`).join('\n');
+  const ctx = {
+    ai, models: { main: 'small-model', fallbacks: [] }, limits: (m) => book.limits('groq', m),
+    s: { ...require('../src/main/corrector').DEFAULTS, executeCode: false }, progress: () => {}, notes: []
+  };
+  const out = await correct(ctx, { files: [
+    { name: 'sujet.txt', parts: [{ type: 'text', text: enonce, label: 'sujet.txt' }] },
+    { name: 'copie.txt', parts: [{ type: 'text', text: reponses, label: 'copie.txt' }] }
+  ] });
+  assert.equal(out.mode, 'chunked');
+  assert.equal(out.result.questions.length, 12);
+  assert.equal(out.result.note.obtenue, 20);
+  assert.equal(out.result.titre, 'Gros devoir');
+  assert.ok(calls.filter((c) => c.startsWith('lot')).length >= 2, calls.join(' '));
+  assert.equal(book.limits('groq', 'small-model').maxOut, 4096);
+  assert.equal(book.limits('groq', 'small-model').tpm, 8000);
+});

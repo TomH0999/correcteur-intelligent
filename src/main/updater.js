@@ -16,8 +16,11 @@ function setState(patch) {
   send(state);
 }
 
-function init({ notify, enabled = true }) {
+let beforeInstall = async () => {};
+
+function init({ notify, enabled = true, onBeforeInstall }) {
   send = notify;
+  if (onBeforeInstall) beforeInstall = onBeforeInstall;
   if (!app.isPackaged) {
     setState({ status: 'dev' });
     return;
@@ -35,7 +38,11 @@ function init({ notify, enabled = true }) {
   autoUpdater.on('update-available', (i) => setState({ status: 'downloading', version: i.version, progress: 0 }));
   autoUpdater.on('update-not-available', () => setState({ status: 'uptodate', checkedAt: new Date().toISOString() }));
   autoUpdater.on('download-progress', (p) => setState({ status: 'downloading', progress: Math.round(p.percent) }));
-  autoUpdater.on('update-downloaded', (i) => setState({ status: 'ready', version: i.version, progress: 100 }));
+  autoUpdater.on('update-downloaded', (i) => {
+    setState({ status: 'ready', version: i.version, progress: 100 });
+    // La mise à jour s'installera à la fermeture : sauvegarde de sécurité dès maintenant
+    Promise.resolve(beforeInstall()).catch((err) => console.warn('Sauvegarde avant mise à jour :', err.message));
+  });
   autoUpdater.on('error', (err) => setState({ status: 'error', error: String(err?.message || err).split('\n')[0] }));
   if (enabled) {
     setTimeout(check, 8000);
@@ -49,8 +56,10 @@ function check() {
   return state;
 }
 
-function installNow() {
+async function installNow() {
   if (autoUpdater && state.status === 'ready') {
+    // Sauvegarde de sécurité des données avant de remplacer l'application
+    try { await beforeInstall(); } catch (err) { console.warn('Sauvegarde avant mise à jour :', err.message); }
     setImmediate(() => autoUpdater.quitAndInstall(false, true));
     return true;
   }
