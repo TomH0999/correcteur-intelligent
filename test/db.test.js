@@ -3,11 +3,15 @@ const assert = require('node:assert');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const initSqlJs = require('sql.js');
 const { Database } = require('../src/main/db');
 const { normalizeResult } = require('../src/main/corrector');
+const backup = require('../src/main/backup');
+
+const tmp = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ci-')), 'db.sqlite');
 
 test('dossiers, enregistrement, recherche sans accents, persistance', async () => {
-  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ci-')), 'db.sqlite');
+  const file = tmp();
   const db = await new Database(file).open();
   const f1 = db.createFolder('S1 — Bases de données');
   const f2 = db.createFolder('TD', f1);
@@ -20,7 +24,67 @@ test('dossiers, enregistrement, recherche sans accents, persistance', async () =
   assert.throws(() => db.moveFolder(f1, f2));
   db.deleteFolder(f1);
   assert.equal(db.listFolders().length, 0);
-  assert.equal(db.getCorrection(id).folder_id, null); // reste dans l'historique
+  assert.equal(db.getCorrection(id).folder_id, null);
   const db2 = await new Database(file).open();
   assert.equal(db2.getCorrection(id).result.titre, 'Requêtes SQL');
+});
+
+test('migration d\'une base v1.0 (sans uuid) sans perte', async () => {
+  const SQL = await initSqlJs({ wasmBinary: fs.readFileSync(require.resolve('sql.js/dist/sql-wasm.wasm')) });
+  const old = new SQL.Database();
+  old.run(`CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, parent_id INTEGER, color TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE corrections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, folder_id INTEGER, created_at TEXT NOT NULL, subject TEXT, exercise_type TEXT, score REAL, grade REAL, grade_max REAL, files TEXT, consigne TEXT, result TEXT NOT NULL, sources TEXT, model TEXT, search_text TEXT);
+    INSERT INTO corrections (name, created_at, result, score) VALUES ('ancienne', '2026-11-01T10:00:00Z', '{"titre":"x"}', 50);`);
+  const file = tmp();
+  fs.writeFileSync(file, Buffer.from(old.export()));
+  const db = await new Database(file).open();
+  const c = db.listCorrections()[0];
+  assert.equal(c.name, 'ancienne');
+  assert.ok(c.uuid);
+});
+
+test('fiches de révision : répétition espacée', async () => {
+  const db = await new Database(tmp()).open();
+  db.addFlashcards([{ front: 'Q', back: 'R', notion: 'jointures' }]);
+  const [card] = db.listFlashcards({ dueOnly: true });
+  const t0 = new Date('2026-11-07T10:00:00Z');
+  let c = db.reviewFlashcard(card.id, 'good', t0);
+  assert.equal(c.box, 1);
+  assert.equal(c.due_at, new Date(t0.getTime() + 86400000).toISOString());
+  c = db.reviewFlashcard(card.id, 'easy', t0);
+  assert.equal(c.box, 3);
+  c = db.reviewFlashcard(card.id, 'again', t0);
+  assert.equal(c.box, 1);
+  assert.equal(c.lapses, 1);
+});
+
+test('sauvegarde puis fusion sur une autre installation, sans doublon', async () => {
+  const a = await new Database(tmp()).open();
+  const f = a.createFolder('Maths');
+  const result = normalizeResult({ titre: 'Dérivées', matiere: 'Maths', note: { obtenue: 12, sur: 20 }, fautes: [{ notion: 'dérivée', description: 'x' }] });
+  const id = a.saveCorrection({ name: 'Dérivées', result, folderId: f });
+  a.addFlashcards([{ front: 'Q', back: 'R' }], { correctionId: id });
+  const settings = { installId: 'aaaaaaaa-1111', get: () => null, set: () => {} };
+  const buf = await backup.buildBackup(a, settings, '1.1.0');
+  const b = await new Database(tmp()).open();
+  b.saveCorrection({ name: 'locale', result: normalizeResult({ titre: 'Local' }) });
+  const s1 = await backup.importBackup(b, buf);
+  assert.equal(s1.corrections, 1);
+  assert.equal(s1.flashcards, 1);
+  const s2 = await backup.importBackup(b, buf);
+  assert.equal(s2.corrections, 0);
+  assert.equal(b.listCorrections().length, 2);
+  const merged = b.listCorrections({ search: 'derivees' })[0];
+  assert.equal(merged.folder_name, 'Maths');
+  const dash = b.dashboard();
+  assert.equal(dash.topNotions[0].notion, 'dérivée');
+  assert.equal(dash.bySubject.length, 2);
+});
+
+test('exercices d\'entraînement', async () => {
+  const db = await new Database(tmp()).open();
+  const id = db.saveExercise({ titre: 'Jointures', matiere: 'BDD', type_exercice: 'base_de_donnees', notions: ['jointures'], enonce: '1. …', difficulte: 'moyenne' });
+  db.updateExercise(id, { draft: 'SELECT …' });
+  assert.equal(db.getExercise(id).draft, 'SELECT …');
+  assert.deepEqual(db.listExercises()[0].notions, ['jointures']);
 });

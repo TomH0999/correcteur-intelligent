@@ -45,6 +45,14 @@ function toMarkdown(rec) {
     if (f.correction) L.push('', `*Correction :* ${f.correction}`);
     L.push('');
   });
+  if (r.executions?.length) {
+    L.push('## Vérification par exécution');
+    r.executions.forEach((e, i) => {
+      L.push(`### Test ${i + 1} (${e.langage}) — ${e.unavailable ? 'non exécuté' : e.ok ? 'exécuté' : 'erreur'} : ${e.but}`);
+      const out = `${e.stdout || ''}${e.stderr ? '\n' + e.stderr : ''}`.trim() || '(vide)';
+      L.push('', '```' + (e.langage || ''), e.code, '```', '', `*Sortie attendue :* ${e.sortie_attendue || '—'}`, '', '```', out, '```', '');
+    });
+  }
   L.push('## Améliorations possibles');
   r.ameliorations.forEach((a) => L.push(`- **${a.titre}** — ${a.detail}`));
   L.push('');

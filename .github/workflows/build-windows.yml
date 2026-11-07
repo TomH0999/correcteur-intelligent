@@ -1,17 +1,25 @@
-name: Build Windows (.exe)
+name: Build Windows (.exe) + mise à jour automatique
 
 on:
   push:
     branches: [main, master, 'claude/**']
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Signature de code (facultative) : ajoute les secrets WIN_CSC_LINK (certificat .pfx en base64)
+      # et WIN_CSC_KEY_PASSWORD dans Settings → Secrets du dépôt pour supprimer l'avertissement SmartScreen.
+      CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,33 +34,51 @@ jobs:
       - name: Tests
         run: npm test
 
-      - name: Construire l'installateur Windows
-        run: npx electron-builder --win nsis --x64 --publish never
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-
-      - name: Lire la version
+      # Chaque build reçoit un numéro de version croissant (majeure.mineure.numéro_de_build) :
+      # c'est ce qui permet aux applications installées de détecter la mise à jour.
+      - name: Numéro de version
         id: v
         shell: bash
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        run: |
+          BASE=$(node -p "require('./package.json').version.split('.').slice(0,2).join('.')")
+          VERSION="$BASE.${{ github.run_number }}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Construire l'installateur Windows
+        shell: bash
+        run: |
+          if [ -z "$CSC_LINK" ]; then unset CSC_LINK CSC_KEY_PASSWORD; fi
+          npx electron-builder --win nsis --x64 --publish never
 
       - name: Publier l'artefact
         uses: actions/upload-artifact@v4
         with:
           name: Correcteur-Intelligent-Setup-${{ steps.v.outputs.version }}
-          path: dist/*.exe
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
           if-no-files-found: error
 
-      - name: Créer / mettre à jour la release GitHub
+      # latest.yml + .blockmap : fichiers lus par la mise à jour automatique de l'application
+      - name: Publier la release GitHub
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.v.outputs.version }}
           name: Correcteur Intelligent v${{ steps.v.outputs.version }}
           target_commitish: ${{ github.sha }}
           make_latest: true
-          files: dist/*.exe
+          files: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
           body: |
             ## Installation (Windows 10/11)
-            1. Télécharge **Correcteur-Intelligent-Setup-${{ steps.v.outputs.version }}.exe** ci-dessous.
-            2. Lance-le. Si Windows SmartScreen affiche « Windows a protégé votre ordinateur », clique sur **Informations complémentaires → Exécuter quand même** (l'application n'est pas signée).
-            3. Au premier lancement, va dans **Paramètres** et colle ta clé API Groq (gratuite : https://console.groq.com/keys).
+            1. Télécharge **Correcteur-Intelligent-Setup-${{ steps.v.outputs.version }}.exe** ci-dessous et lance-le.
+            2. Si Windows SmartScreen affiche « Windows a protégé votre ordinateur » : **Informations complémentaires → Exécuter quand même** (application non signée).
+            3. Au premier lancement, ajoute une clé API dans **Réglages** (Groq est gratuit : https://console.groq.com/keys).
+
+            Les versions déjà installées (1.1 et suivantes) se mettent à jour **automatiquement** : rien à réinstaller.
+
+            Commit : ${{ github.sha }}

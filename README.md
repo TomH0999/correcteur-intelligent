@@ -2,75 +2,89 @@
 
 Application Windows de **correction automatique d'exercices par IA**, pensée pour le **BUT Informatique** :
 maths manuscrites, code (tous langages), bases de données (MCD/MLD, SQL), réseaux, systèmes, UML, etc.
+Le style reprend celui du [Gestionnaire de notes](https://github.com/TomH0999/gestionnaire_de_notes).
 
-Tu importes l'énoncé **et** tes réponses — en un ou plusieurs fichiers, dans n'importe quel format —
-et l'application :
+Tu importes l'énoncé, tes réponses (et éventuellement le barème du prof) — en un ou plusieurs fichiers,
+dans n'importe quel format — et l'application :
 
-1. **convertit tout en texte** lisible par l'IA (OCR/vision pour les manuscrits et schémas, transcription audio…) ;
-2. **détermine elle-même** ce qui est l'énoncé et ce qui est ta copie ;
-3. renvoie une **note** (sur 20 par défaut) et un **score de réussite**, un **rapport de fautes**, des **améliorations possibles**,
-   les **notions à revoir** et une **correction modèle** (avec rendu LaTeX et coloration du code) ;
-4. **enregistre automatiquement** chaque correction dans l'**historique** (base SQLite locale) avec un nom précis et
-   recherchable, par ex. `[BDD] — R1.05 Bases de données — TD3 jointures — 14,5/20 — 2026-11-07 18h42` ;
-5. te permet de **classer** les corrections dans des **dossiers / sous-dossiers** (par semestre, ressource…).
+1. **convertit tout en texte** lisible par l'IA : lecture des manuscrits et schémas par un modèle de vision
+   (testé automatiquement), OCR local de secours, transcription audio… ;
+2. **détermine elle-même** ce qui est l'énoncé, ta copie et le barème ;
+3. **exécute réellement ton code** (Python, JavaScript, SQL intégrés ; Java, C, C++, PHP si installés) avec des tests
+   préparés par l'IA ;
+4. renvoie une **note** et un **score**, le **détail par question**, un **rapport de fautes**, des **améliorations**,
+   les **notions à revoir** et une **correction modèle** (LaTeX et code mis en forme) ;
+5. **enregistre** chaque correction dans l'historique (base SQLite locale) avec un nom précis et recherchable,
+   par ex. `[BDD] — R1.05 Bases de données — TD3 jointures — 14,5/20 — 2026-11-07 18h42`, et te laisse la classer
+   dans des **dossiers / sous-dossiers**.
+
+## ✨ Fonctionnalités
+
+| | |
+|---|---|
+| 🤖 **Plusieurs IA au choix** | Groq (gratuit), Google Gemini (gratuit), Anthropic Claude, OpenAI, ou **Ollama hors ligne**. Les modèles sont lus en direct sur ton compte : plus jamais de « modèle invalide ». |
+| 🔄 **Mises à jour automatiques** | Téléchargées depuis les Releases GitHub et installées à la fermeture. |
+| 🔒 **Données locales** | Une base propre à chaque installation, dans `%APPDATA%\Correcteur Intelligent`. Clés API chiffrées (coffre-fort Windows). |
+| 📈 **Progression** | Courbe des scores par matière, notions qui reviennent dans tes fautes, types d'erreurs. |
+| 🧠 **Fiches de révision** | Créées automatiquement à partir de tes erreurs, révisées en répétition espacée (boîtes de Leitner). |
+| 🏋️ **Exercices d'entraînement** | Générés sur tes points faibles ; réponds dans l'app (avec bouton « Tester mon code »), puis fais corriger. |
+| ⚖️ **Comparaison** | Deux corrections côte à côte : erreurs corrigées, persistantes, nouvelles ; écart question par question. |
+| 📏 **Barème du prof** | Importe une grille ou un corrigé officiel : l'IA l'applique strictement. |
+| 📱 **Photo depuis le téléphone** | Scanne un QR code : les photos de ta copie arrivent directement dans l'app (même Wi-Fi). |
+| 💾 **Sauvegarde & synchro** | Export/import sans doublon ; synchronisation facultative entre tes PC via un dossier OneDrive / Google Drive / Dropbox. |
+| 📄 **Export** | Rapport en Markdown ou PDF. |
 
 ## 📥 Installation
 
-1. Va dans l'onglet **[Releases](https://github.com/TomH0999/correcteur-intelligent/releases)** du dépôt
-   (ou dans **Actions → Build Windows → Artifacts**).
+1. Va dans les **[Releases](https://github.com/TomH0999/correcteur-intelligent/releases)** du dépôt.
 2. Télécharge `Correcteur-Intelligent-Setup-x.y.z.exe` et lance-le.
    *SmartScreen* peut avertir que l'application n'est pas signée : **Informations complémentaires → Exécuter quand même**.
-3. Crée une clé API **gratuite** sur <https://console.groq.com/keys>, puis colle-la dans **Paramètres** de l'application
-   (elle est chiffrée sur ton PC avec le coffre-fort Windows).
+3. Au premier lancement, ouvre **Réglages** et colle une clé API — la plus simple : **Groq**, gratuite, sur
+   <https://console.groq.com/keys>.
+
+Les mises à jour suivantes s'installent ensuite toutes seules (à partir de la version 1.1).
 
 ## 📄 Formats acceptés
 
 | Catégorie | Formats | Traitement |
 |---|---|---|
-| PDF | `.pdf` (texte **ou** scanné/manuscrit) | texte extrait + pages scannées, manuscrites ou avec figures rendues en image puis lues par l'IA de vision |
-| Images | `.jpg .png .webp .gif .bmp .avif` + **Ctrl+V** d'une capture | lues par un modèle de vision : texte, formules → LaTeX, code, MCD/UML/schémas réseau décrits de façon structurée |
-| Bureautique | `.docx .pptx .xlsx .xls .odt .ods .odp .rtf .csv` (+ images intégrées) | texte, tableaux, formules de tableur, images des documents |
-| Code | `.py .java .c .cpp .cs .js .ts .php .sql .html .css .sh .kt .go .rs …` et **tout fichier texte** | conservé tel quel avec le langage détecté |
+| PDF | `.pdf` (texte **ou** scanné/manuscrit) | texte extrait + pages scannées, manuscrites ou avec figures lues par l'IA de vision |
+| Images | `.jpg .png .webp .gif .bmp .avif`, **Ctrl+V** d'une capture, **photo du téléphone** | vision : texte, formules → LaTeX, code, MCD/UML/schémas réseau décrits de façon structurée ; OCR local en secours |
+| Bureautique | `.docx .pptx .xlsx .xls .odt .ods .odp .rtf .csv` (+ images intégrées) | texte, tableaux, formules de tableur, images |
+| Code | `.py .java .c .cpp .cs .js .ts .php .sql .html .css .sh .kt .go .rs …` et **tout fichier texte** | conservé tel quel, exécuté si possible |
 | Notebooks | `.ipynb` | cellules + sorties |
-| Diagrammes | `.drawio .dio` (draw.io / diagrams.net), `.puml`, `.mmd` | entités, attributs, associations et cardinalités extraites |
-| Archives / dossiers | `.zip .tar .tar.gz` ou un **dossier entier** (projet) | parcourus récursivement (ignore `node_modules`, `.git`, `__MACOSX`…) |
-| Audio / vidéo | `.mp3 .wav .m4a .ogg .webm .mp4` (≤ 25 Mo) | transcription Whisper (oral, consignes dictées) |
-
-Chaque fichier peut être laissé en **🤖 Auto** (l'IA décide) ou forcé en **📋 Énoncé** / **✍ Mes réponses**.
-
-## 🧠 IA utilisée (Groq)
-
-| Étape | Modèle par défaut | Rôle |
-|---|---|---|
-| Vision | `meta-llama/llama-4-scout-17b-16e-instruct` | transcription des images / pages scannées |
-| Audio | `whisper-large-v3` | transcription |
-| Correction | `openai/gpt-oss-120b` | identification énoncé/réponses + correction en JSON |
-| Secours | `llama-3.3-70b-versatile`, `llama-4-scout` | utilisés automatiquement si le modèle principal est indisponible ou si la requête dépasse les limites de l'offre gratuite |
-
-Tous les modèles, le niveau (BUT 1/2/3…), la sévérité, le barème et la stratégie d'analyse des PDF sont réglables dans **Paramètres**.
+| Diagrammes | `.drawio .dio` (draw.io), `.puml`, `.mmd` | entités, attributs, associations et cardinalités extraites |
+| Archives / dossiers | `.zip .tar .tar.gz` ou un **dossier entier** | parcourus récursivement (ignore `node_modules`, `.git`, `__MACOSX`…) |
+| Audio / vidéo | `.mp3 .wav .m4a .ogg .webm .mp4` (≤ 25 Mo) | transcription Whisper (Groq ou OpenAI) |
 
 ## 🛠 Développement
 
 ```bash
 npm install
-npm start          # lance l'application
-npm test           # tests (extraction, base de données, pipeline IA simulé)
+npm start          # lance l'application (données séparées : « Correcteur Intelligent (dev) »)
+npm test           # tests : extraction, base de données, sauvegarde/fusion, modèles IA, exécution de code, serveur téléphone
 npm run dist:win   # construit l'installateur .exe (sous Windows)
 ```
 
-L'installateur Windows est construit automatiquement par **GitHub Actions** (`.github/workflows/build-windows.yml`)
-à chaque push, et publié dans les Releases.
+À chaque push, **GitHub Actions** (`.github/workflows/build-windows.yml`) lance les tests, construit l'installateur,
+lui attribue la version `1.1.<numéro de build>` et publie une Release avec `latest.yml` : c'est ce fichier que les
+applications installées consultent pour se mettre à jour.
 
-Architecture :
+**Signature de code (facultatif)** : ajoute les secrets `WIN_CSC_LINK` (certificat `.pfx` en base64) et
+`WIN_CSC_KEY_PASSWORD` dans *Settings → Secrets and variables → Actions* pour signer l'installateur et supprimer
+l'avertissement SmartScreen.
 
 ```
-src/main/        processus principal Electron
-  extractors.js  conversion universelle fichier → texte / images / audio
-  groq.js        client API Groq (reprises automatiques, limites de débit)
-  corrector.js   prompts, transcription vision/audio, correction, normalisation de la note
-  db.js          base SQLite (sql.js) : dossiers + corrections + recherche
-  report.js      export Markdown
-src/renderer/    interface (HTML/CSS/JS, pdf.js, KaTeX, marked)
+src/main/          processus principal Electron
+  extractors.js    conversion universelle fichier → texte / images / audio
+  providers.js     Groq, OpenAI, Gemini, Ollama (API compatible OpenAI) et Anthropic (SDK officiel)
+  models.js        liste des modèles en direct, test des modèles de vision, choix automatique
+  corrector.js     prompts, lecture des images, tests d'exécution, correction, fiches, exercices
+  runner.js        exécution de code (worker Python/JS/SQL + compilateurs locaux)
+  ocr.js           OCR local Tesseract (secours hors ligne)
+  db.js            SQLite (sql.js) : dossiers, corrections, fiches, exercices, tableau de bord, fusion
+  backup.js        sauvegarde, restauration, synchronisation par dossier cloud
+  updater.js       mises à jour automatiques (electron-updater)
+  phone.js         serveur local + QR code pour envoyer des photos depuis le téléphone
+src/renderer/      interface (HTML/CSS/JS, Inter, Font Awesome, pdf.js, KaTeX, marked)
 ```
-
-Les données (base `corrections.sqlite`, paramètres) sont stockées dans `%APPDATA%\Correcteur Intelligent`.

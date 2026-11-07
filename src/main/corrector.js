@@ -1,22 +1,25 @@
 'use strict';
 /**
  * Pipeline de correction :
- *  1. transcription des images (manuscrits, photos, schémas, captures) par un modèle de vision ;
- *  2. transcription des fichiers audio/vidéo (Whisper) ;
- *  3. identification automatique énoncé / réponses + correction détaillée par un LLM, en JSON.
+ *  1. lecture des images (modèle de vision vérifié, sinon OCR local) et transcription audio ;
+ *  2. (option) vérification par exécution réelle du code de l'étudiant ;
+ *  3. identification énoncé / réponses / barème + correction détaillée en JSON ;
+ * + générateurs : fiches de révision (flashcards) et exercices d'entraînement.
  */
-const { GroqClient, GroqError } = require('./groq');
+const { AIError } = require('./providers');
 
 const DEFAULTS = {
-  correctionModel: 'openai/gpt-oss-120b',
-  fallbackModels: ['llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct'],
-  visionModel: 'meta-llama/llama-4-scout-17b-16e-instruct',
-  audioModel: 'whisper-large-v3',
+  provider: 'groq',
+  correctionModel: 'auto',
+  visionModel: 'auto',
+  audioModel: 'auto',
   maxInputChars: 60000,
   gradeMax: 20,
   level: 'BUT Informatique — 1re année',
   severity: 'normale',
-  reasoningEffort: 'medium'
+  reasoningEffort: 'medium',
+  executeCode: true,
+  autoFlashcards: true
 };
 
 const EXERCISE_TYPES = ['maths', 'developpement', 'base_de_donnees', 'reseau', 'systeme', 'algorithmique', 'web', 'genie_logiciel', 'architecture', 'anglais', 'communication', 'gestion', 'autre'];
@@ -27,11 +30,11 @@ Règles :
 - Texte (imprimé ou manuscrit) : recopie-le mot pour mot, en conservant la numérotation (Exercice 1, Q2, a), b)…). Les fautes de l'élève doivent être conservées.
 - Mathématiques : écris toutes les formules en LaTeX entre $…$ (ou $$…$$ pour les formules centrées). Conserve chaque étape de calcul, les ratures significatives (« [barré : …] »).
 - Code (manuscrit ou capture) : recopie-le dans un bloc \`\`\`langage en respectant l'indentation.
-- Schémas de bases de données (MCD/MLD/MPD, Merise, UML, entité-association) : liste chaque entité/table avec ses attributs (identifiants/clés primaires soulignés -> notés [PK], clés étrangères [FK]), chaque association avec ses cardinalités exactes des deux côtés (ex. « CLIENT (0,n) — passe — (1,1) COMMANDE »).
-- Diagrammes UML (classes, cas d'utilisation, séquence), automates, arbres, graphes, schémas réseau, algorigrammes : décris la structure de façon exhaustive et structurée (nœuds, liens, étiquettes, multiplicités, adresses IP/masques…).
+- Schémas de bases de données (MCD/MLD/MPD, Merise, UML, entité-association) : liste chaque entité/table avec ses attributs (identifiants/clés primaires -> [PK], clés étrangères [FK]), chaque association avec ses cardinalités exactes des deux côtés (ex. « CLIENT (0,n) — passe — (1,1) COMMANDE »).
+- Diagrammes UML, automates, arbres, graphes, schémas réseau, algorigrammes : décris la structure de façon exhaustive (nœuds, liens, étiquettes, multiplicités, adresses IP/masques…).
 - Tableaux : restitue-les en tableau Markdown.
 - Si un passage est illisible, écris [illisible] plutôt que d'inventer.
-- Indique en première ligne la nature de l'image entre crochets : [énoncé imprimé], [copie manuscrite], [capture de code], [schéma], [mélange énoncé + réponses], etc.
+- Indique en première ligne la nature de l'image entre crochets : [énoncé imprimé], [copie manuscrite], [capture de code], [schéma], [barème], [mélange énoncé + réponses], etc.
 Réponds uniquement avec la transcription, sans commentaire ni correction.`;
 
 function buildSystemPrompt(s) {
@@ -40,10 +43,11 @@ Tu maîtrises tout le programme du BUT Informatique : mathématiques (analyse, a
 
 TA MISSION
 On te fournit un ou plusieurs documents (déjà convertis en texte ; les images ont été transcrites automatiquement, des erreurs de transcription sont possibles).
-1. IDENTIFIE toi-même ce qui relève de l'ÉNONCÉ (sujet, consignes, questions, barème) et ce qui relève des RÉPONSES de l'étudiant. Un même fichier peut contenir les deux ; un énoncé peut aussi être absent : dans ce cas, déduis les questions à partir des réponses et signale-le.
+1. IDENTIFIE toi-même ce qui relève de l'ÉNONCÉ (sujet, consignes, questions), des RÉPONSES de l'étudiant et, s'il y en a, du BARÈME / CORRIGÉ DU PROFESSEUR. Un même fichier peut contenir plusieurs de ces éléments ; un énoncé peut aussi être absent : dans ce cas, déduis les questions à partir des réponses et signale-le.
 2. CORRIGE chaque question/exercice : vérifie l'exactitude (calculs refaits étape par étape, code exécuté mentalement avec des cas limites, requêtes SQL vérifiées sur leur logique, schémas confrontés aux règles de modélisation), la méthode, la rigueur, la rédaction et les bonnes pratiques.
-3. NOTE de façon juste sur ${s.gradeMax} (respecte le barème de l'énoncé s'il existe, sinon répartis les points de manière cohérente). Sévérité demandée : ${s.severity}. Une erreur de transcription évidente (OCR) ne doit pas être sanctionnée ; signale-la plutôt.
-4. Rédige un RAPPORT DE FAUTES précis, des AMÉLIORATIONS possibles et une liste de NOTIONS À REVOIR, puis une CORRECTION MODÈLE complète.
+3. Si des RÉSULTATS D'EXÉCUTION RÉELLE du code sont fournis, appuie-toi dessus en priorité (ce sont des faits) et cite-les dans tes commentaires. Attention : un échec peut venir du programme de test et non de l'étudiant ; juge avec discernement.
+4. NOTE de façon juste sur ${s.gradeMax}. Si un barème ou un corrigé du professeur est fourni, APPLIQUE-LE STRICTEMENT (mêmes points par question, mêmes attendus) puis ramène la note sur ${s.gradeMax}. Sinon respecte le barème de l'énoncé s'il existe, ou répartis les points de manière cohérente. Sévérité demandée : ${s.severity}. Une erreur de transcription évidente (OCR) ne doit pas être sanctionnée ; signale-la plutôt.
+5. Rédige un RAPPORT DE FAUTES précis, des AMÉLIORATIONS possibles et une liste de NOTIONS À REVOIR, puis une CORRECTION MODÈLE complète.
 
 RÈGLES DE FORME
 - Tout en français, ton pédagogique, direct, concret. Tutoie l'étudiant.
@@ -60,6 +64,7 @@ FORMAT DE SORTIE : réponds UNIQUEMENT avec un objet JSON valide respectant exac
   "identification": {
     "enonce": ["noms des fichiers (ou parties) identifiés comme énoncé"],
     "reponses": ["noms des fichiers (ou parties) identifiés comme réponses de l'étudiant"],
+    "bareme": ["noms des fichiers (ou parties) identifiés comme barème/corrigé du professeur (souvent vide)"],
     "enonce_present": true,
     "remarques": "comment tu as fait la distinction, problèmes de lisibilité éventuels"
   },
@@ -72,7 +77,7 @@ FORMAT DE SORTIE : réponds UNIQUEMENT avec un objet JSON valide respectant exac
     { "numero": "1.a", "intitule": "résumé de la question", "statut": "correct | partiel | incorrect | non_traite", "points_obtenus": 0, "points_max": 0, "commentaire": "explication de la correction pour cette question" }
   ],
   "fautes": [
-    { "question": "1.a", "gravite": "mineure | moyenne | majeure", "categorie": "calcul | raisonnement | syntaxe | logique | modelisation | conception | methode | redaction | notation | performance | securite | bonnes_pratiques | hors_sujet | autre", "description": "ce qui est faux et pourquoi", "extrait": "extrait exact de la réponse fautive", "correction": "la bonne version" }
+    { "question": "1.a", "gravite": "mineure | moyenne | majeure", "categorie": "calcul | raisonnement | syntaxe | logique | modelisation | conception | methode | redaction | notation | performance | securite | bonnes_pratiques | hors_sujet | autre", "notion": "notion du cours concernée (ex. « jointures SQL », « dérivée d'un produit »)", "description": "ce qui est faux et pourquoi", "extrait": "extrait exact de la réponse fautive", "correction": "la bonne version" }
   ],
   "ameliorations": [ { "titre": "…", "detail": "conseil concret et actionnable (avec exemple si utile)" } ],
   "a_revoir": [ { "notion": "…", "priorite": "haute | moyenne | basse", "pourquoi": "…", "ressources": "pistes : chapitre du cours, exercice type, documentation officielle…" } ],
@@ -83,7 +88,7 @@ FORMAT DE SORTIE : réponds UNIQUEMENT avec un objet JSON valide respectant exac
 
 function parseJsonLoose(text) {
   if (!text) throw new Error('Réponse vide du modèle.');
-  let t = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
+  const t = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
   try {
     return JSON.parse(t);
   } catch {
@@ -119,7 +124,6 @@ function normalizeResult(raw, gradeMax = 20) {
   if (obtenue == null && totalMax > 0) obtenue = (totalGot / totalMax) * sur;
   if (obtenue == null && r.score_pourcentage != null) obtenue = (num(r.score_pourcentage) / 100) * sur;
   obtenue = Math.min(sur, Math.max(0, obtenue ?? 0));
-  // Ramène la note sur le barème choisi par l'utilisateur
   if (sur !== gradeMax) {
     obtenue = (obtenue / sur) * gradeMax;
     sur = gradeMax;
@@ -135,6 +139,7 @@ function normalizeResult(raw, gradeMax = 20) {
     identification: {
       enonce: arr(r.identification?.enonce).map(str),
       reponses: arr(r.identification?.reponses).map(str),
+      bareme: arr(r.identification?.bareme).map(str),
       enonce_present: r.identification?.enonce_present !== false,
       remarques: str(r.identification?.remarques)
     },
@@ -148,6 +153,7 @@ function normalizeResult(raw, gradeMax = 20) {
       question: str(f.question),
       gravite: ['mineure', 'moyenne', 'majeure'].includes(f.gravite) ? f.gravite : 'moyenne',
       categorie: str(f.categorie) || 'autre',
+      notion: str(f.notion),
       description: str(f.description),
       extrait: str(f.extrait),
       correction: str(f.correction)
@@ -160,7 +166,8 @@ function normalizeResult(raw, gradeMax = 20) {
       ressources: str(a.ressources)
     })),
     correction_modele: str(r.correction_modele),
-    mots_cles: arr(r.mots_cles).map(str).slice(0, 15)
+    mots_cles: arr(r.mots_cles).map(str).slice(0, 15),
+    executions: arr(r.executions)
   };
 }
 
@@ -204,171 +211,238 @@ function fitSources(sources, maxChars) {
   };
 }
 
-function buildUserMessage(sources, consigne) {
-  const roleLabel = { enonce: 'ÉNONCÉ (indiqué par l\'utilisateur)', reponse: 'RÉPONSES DE L\'ÉTUDIANT (indiqué par l\'utilisateur)', auto: 'à déterminer' };
-  const blocks = sources.map((s, i) => {
-    const kind = s.kind === 'image' ? 'transcription automatique d\'image' : s.kind === 'audio' ? 'transcription audio' : s.kind === 'pdf-page' ? 'page de PDF' : 'texte extrait';
+const ROLE_LABEL = {
+  enonce: 'ÉNONCÉ (indiqué par l\'utilisateur)',
+  reponse: 'RÉPONSES DE L\'ÉTUDIANT (indiqué par l\'utilisateur)',
+  bareme: 'BARÈME / CORRIGÉ DU PROFESSEUR (indiqué par l\'utilisateur) — à appliquer strictement',
+  auto: 'à déterminer'
+};
+
+function documentsBlock(sources) {
+  return sources.map((s, i) => {
+    const kind = s.kind === 'image' ? 'transcription automatique d\'image' : s.kind === 'audio' ? 'transcription audio' : s.kind === 'pdf-page' ? 'page de PDF' : s.kind === 'generated' ? 'exercice généré par l\'application' : 'texte extrait';
     return `<<<DOCUMENT ${i + 1}
 fichier: ${s.file}
 partie: ${s.label}
 nature: ${kind}
-rôle: ${roleLabel[s.role] || roleLabel.auto}
+rôle: ${ROLE_LABEL[s.role] || ROLE_LABEL.auto}
 ---
 ${s.text}
 DOCUMENT ${i + 1}>>>`;
-  });
-  return `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}Voici les ${sources.length} document(s) fournis. Identifie l'énoncé et les réponses, puis corrige.\n\n${blocks.join('\n\n')}\n\nRéponds uniquement avec l'objet JSON demandé.`;
+  }).join('\n\n');
 }
 
-const VISION_FALLBACKS = ['meta-llama/llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-maverick-17b-128e-instruct'];
-
-/** Appel au modèle de vision, avec bascule si le modèle configuré n'est plus disponible. */
-async function visionChat(client, s, opts) {
-  const models = [s.visionModel, ...VISION_FALLBACKS.filter((m) => m !== s.visionModel)];
-  let lastErr;
-  for (const model of models) {
-    try {
-      return await client.chat({ ...opts, model });
-    } catch (err) {
-      lastErr = err;
-      if (!(err instanceof GroqError) || !err.canFallback) throw err;
-    }
-  }
-  throw lastErr;
+function executionsBlock(executions) {
+  if (!executions?.length) return '';
+  return `\n\nRÉSULTATS D'EXÉCUTION RÉELLE (le code de l'étudiant a été exécuté par l'application avec des tests) :\n${executions.map((e, i) => `--- Test ${i + 1} (${e.langage}) : ${e.but}
+Sortie attendue : ${e.sortie_attendue || '(non précisée)'}
+${e.unavailable ? `Non exécuté : ${e.stderr}` : `Code de retour : ${e.exitCode}${e.timedOut ? ' (TEMPS DÉPASSÉ)' : ''}
+Sortie obtenue :
+${(e.stdout || '').slice(0, 3000) || '(vide)'}${e.stderr ? `\nErreurs :\n${e.stderr.slice(0, 2000)}` : ''}`}`).join('\n\n')}`;
 }
 
 async function mapLimit(items, limit, fn) {
-  const results = new Array(items.length);
   let i = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (i < items.length) {
       const idx = i++;
-      results[idx] = await fn(items[idx], idx);
+      await fn(items[idx], idx);
     }
   });
   await Promise.all(workers);
-  return results;
 }
 
 /**
- * Convertit les parties extraites (texte, images, audio) en sources textuelles.
+ * Contexte d'exécution : fournisseur IA, modèles résolus (vérifiés sur le compte), réglages.
+ * ctx = { ai, audioAi, models: { main, fallbacks, vision, audio }, s, progress, signal, notes, ocr }
  */
-async function buildSources(files, client, s, progress, signal) {
-  const jobs = [];
-  for (const f of files) {
-    for (const p of f.parts) jobs.push({ file: f.name, role: f.role || 'auto', part: p });
-  }
-  const images = jobs.filter((j) => j.part.type === 'image');
-  const audios = jobs.filter((j) => j.part.type === 'audio');
-  const warnings = [];
-  let done = 0;
-  if (images.length) progress({ step: 'vision', message: `Lecture de ${images.length} image(s) (manuscrits, schémas, captures)…`, done, total: images.length });
-  await mapLimit(images, 2, async (j) => {
+async function readImage(ctx, j) {
+  if (ctx.models.vision) {
     try {
-      const r = await visionChat(client, s, {
+      const r = await ctx.ai.chat({
+        model: ctx.models.vision,
         temperature: 0,
         maxTokens: 4096,
-        signal,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: VISION_PROMPT + `\n(Fichier : ${j.part.label})` },
-            { type: 'image_url', image_url: { url: `data:${j.part.mime || 'image/jpeg'};base64,${j.part.base64}` } }
-          ]
-        }]
+        signal: ctx.signal,
+        messages: [{ role: 'user', content: [{ type: 'text', text: VISION_PROMPT + `\n(Fichier : ${j.part.label})` }, { type: 'image', mime: j.part.mime || 'image/jpeg', base64: j.part.base64 }] }]
       });
-      j.text = r.content.trim();
+      if (r.content.trim()) return { text: r.content.trim(), via: ctx.models.vision };
     } catch (err) {
       if (err.code === 'aborted' || err.status === 401) throw err;
-      warnings.push(`Image « ${j.part.label} » non lue : ${err.message}`);
+      ctx.notes.push(`Vision indisponible pour « ${j.part.label} » (${err.message}) : OCR local utilisé.`);
+    }
+  }
+  if (ctx.ocr) return { text: await ctx.ocr(j.part.base64), via: 'ocr' };
+  throw new Error('aucun lecteur d\'image disponible');
+}
+
+async function buildSources(files, ctx) {
+  const jobs = [];
+  for (const f of files) for (const p of f.parts) jobs.push({ file: f.name, role: f.role || 'auto', part: p });
+  const images = jobs.filter((j) => j.part.type === 'image');
+  const audios = jobs.filter((j) => j.part.type === 'audio');
+  let done = 0;
+  if (images.length) ctx.progress({ step: 'vision', message: `Lecture de ${images.length} image(s) avec ${ctx.models.vision || 'l\'OCR local'}…`, done, total: images.length });
+  await mapLimit(images, 2, async (j) => {
+    try {
+      const r = await readImage(ctx, j);
+      j.text = r.text;
+    } catch (err) {
+      if (err.code === 'aborted' || err.status === 401) throw err;
+      ctx.notes.push(`Image « ${j.part.label} » non lue : ${err.message}`);
       j.text = '';
     }
     done++;
-    progress({ step: 'vision', message: `Image ${done}/${images.length} transcrite`, done, total: images.length });
+    ctx.progress({ step: 'vision', message: `Image ${done}/${images.length} lue`, done, total: images.length });
   });
   for (const [k, j] of audios.entries()) {
-    progress({ step: 'audio', message: `Transcription audio ${k + 1}/${audios.length}…` });
+    ctx.progress({ step: 'audio', message: `Transcription audio ${k + 1}/${audios.length}…` });
     try {
-      j.text = await client.transcribeAudio({ base64: j.part.base64, filename: j.part.filename, mime: j.part.mime, model: s.audioModel, signal });
+      if (!ctx.audioAi || !ctx.models.audio) throw new Error('aucun service de transcription audio (ajoute une clé Groq ou OpenAI)');
+      j.text = await ctx.audioAi.transcribe({ base64: j.part.base64, filename: j.part.filename, mime: j.part.mime, model: ctx.models.audio, signal: ctx.signal });
     } catch (err) {
-      if (err.code === 'aborted' || err.status === 401) throw err;
-      warnings.push(`Audio « ${j.part.label} » non transcrit : ${err.message}`);
+      if (err.code === 'aborted') throw err;
+      ctx.notes.push(`Audio « ${j.part.label} » non transcrit : ${err.message}`);
       j.text = '';
     }
   }
-  const sources = jobs
+  return jobs
     .map((j) => ({
       file: j.file,
       role: j.role,
       label: j.part.label || j.file,
-      kind: j.part.type === 'text' ? (j.part.fromPdf ? 'pdf-page' : 'text') : j.part.type,
+      kind: j.part.type === 'text' ? (j.part.fromPdf ? 'pdf-page' : j.part.generated ? 'generated' : 'text') : j.part.type,
       text: j.part.type === 'text' ? (j.part.lang && !/markdown/.test(j.part.lang) ? '```' + j.part.lang + '\n' + j.part.text + '\n```' : j.part.text) : j.text
     }))
     .filter((x) => x.text && x.text.trim());
-  return { sources, warnings };
 }
 
-async function runCorrection({ client, sources, consigne, settings: s, progress, signal }) {
-  const { sources: fitted, truncated } = fitSources(sources, s.maxInputChars);
-  const warnings = [];
-  if (truncated) warnings.push(`Les documents dépassent ${s.maxInputChars.toLocaleString('fr-FR')} caractères : certaines parties ont été tronquées (réglable dans les Paramètres).`);
-  const messages = [
-    { role: 'system', content: buildSystemPrompt(s) },
-    { role: 'user', content: buildUserMessage(fitted, consigne) }
-  ];
-  const models = [s.correctionModel, ...s.fallbackModels.filter((m) => m && m !== s.correctionModel)];
+/** Appel au modèle principal avec bascule automatique sur les modèles de secours. */
+async function chatWithFallback(ctx, { system, user, json = true, maxTokens = 8192, step = 'correction', label = 'Correction' }) {
+  const models = [ctx.models.main, ...(ctx.models.fallbacks || [])].filter(Boolean);
   let lastErr;
   for (const model of models) {
     for (let attempt = 0; attempt < 2; attempt++) {
-      progress({ step: 'correction', message: `Correction en cours avec ${model}${attempt ? ' (nouvel essai)' : ''}…` });
+      ctx.progress({ step, message: `${label} en cours avec ${model}${attempt ? ' (nouvel essai)' : ''}…` });
       try {
-        const r = await client.chat({
-          model,
-          messages,
-          json: true,
-          temperature: 0.2,
-          maxTokens: attempt ? 16384 : 8192,
-          reasoningEffort: s.reasoningEffort,
-          signal
-        });
+        const r = await ctx.ai.chat({ model, system, messages: [{ role: 'user', content: user }], json, maxTokens: attempt ? maxTokens * 2 : maxTokens, effort: ctx.s.reasoningEffort, signal: ctx.signal });
         if (r.finishReason === 'length' && attempt === 0) continue;
-        const parsed = parseJsonLoose(r.content);
-        const result = normalizeResult(parsed, s.gradeMax);
-        if (model !== s.correctionModel) warnings.push(`Le modèle principal n'a pas pu être utilisé ; correction réalisée avec ${model}.`);
-        return { result, model: r.model, warnings };
+        const parsed = json ? parseJsonLoose(r.content) : r.content;
+        if (model !== ctx.models.main) ctx.notes.push(`Le modèle principal n'a pas pu être utilisé ; ${label.toLowerCase()} réalisée avec ${model}.`);
+        return { parsed, model: r.model || model };
       } catch (err) {
         lastErr = err;
         if (err.code === 'aborted' || err.status === 401) throw err;
-        if (err instanceof GroqError && !err.canFallback && err.status !== 400) throw err;
-        if (err instanceof GroqError) break; // modèle suivant
+        if (err instanceof AIError && !err.canFallback && err.status !== 400 && err.status !== 422) throw err;
+        if (err instanceof AIError) break; // modèle suivant
         // JSON invalide : nouvel essai, puis modèle suivant
       }
     }
   }
-  const hint = lastErr && /tokens|too large|413/i.test(`${lastErr.message} ${lastErr.code}`)
-    ? ' Les documents sont trop volumineux pour les limites de votre offre Groq : réduisez le nombre de fichiers ou la limite de caractères dans les Paramètres.'
+  const hint = lastErr && /tokens|too large|413|context/i.test(`${lastErr.message} ${lastErr.code}`)
+    ? ' Les documents sont trop volumineux pour les limites de ton offre : réduis le nombre de fichiers ou la limite de caractères dans les Paramètres.'
     : '';
-  throw new Error(`La correction a échoué : ${lastErr?.message || 'erreur inconnue'}.${hint}`);
+  throw new Error(`${label} impossible : ${lastErr?.message || 'erreur inconnue'}.${hint}`);
 }
 
-/**
- * Point d'entrée : fichiers extraits -> correction complète.
- */
-async function correct({ apiKey, files, consigne, settings, progress = () => {}, signal, fetchImpl }) {
-  const s = { ...DEFAULTS, ...settings };
-  const client = new GroqClient(apiKey, { fetchImpl });
-  const { sources, warnings } = await buildSources(files, client, s, progress, signal);
+const CODE_LANGS = /```(python|py|javascript|js|sql|java|c|cpp|c\+\+|php|typescript|ts|plsql|mysql)\b/i;
+
+function hasRunnableCode(sources) {
+  return sources.some((s) => CODE_LANGS.test(s.text) || /\b(def |public class |#include|SELECT .+ FROM|CREATE TABLE|function\s*\w*\s*\(|console\.log|System\.out)/i.test(s.text));
+}
+
+/** Demande à l'IA un plan de tests, puis exécute réellement le code de l'étudiant. */
+async function verifyByExecution(ctx, sources, consigne, runCode) {
+  if (!ctx.s.executeCode || !runCode || !hasRunnableCode(sources)) return [];
+  const { sources: fitted } = fitSources(sources, Math.min(ctx.s.maxInputChars, 30000));
+  const system = `Tu prépares des tests d'exécution pour vérifier le code écrit par un étudiant en informatique.
+Langages exécutables : python, javascript, sql (SQLite), java (fichier unique avec main), c, cpp, php.
+Pour chaque réponse de code de l'ÉTUDIANT (pas l'énoncé), écris un programme COMPLET et AUTONOME qui reprend son code TEL QUEL (sans corriger ses erreurs) et ajoute des appels de test qui AFFICHENT les résultats (cas normaux et cas limites demandés par l'énoncé).
+Pour le SQL : crée d'abord les tables et insère un petit jeu de données cohérent avec l'énoncé (en SQLite), puis exécute les requêtes de l'étudiant telles quelles. Adapte uniquement la syntaxe spécifique à un SGBD (ex. Oracle) si c'est indispensable pour SQLite.
+Indique la sortie attendue si le code était correct. Au maximum 5 tests, les plus révélateurs. Si rien n'est exécutable, renvoie une liste vide.
+Réponds UNIQUEMENT en JSON : {"executions":[{"but":"ce que le test vérifie","langage":"python|javascript|sql|java|c|cpp|php","code":"programme complet","entree":"texte envoyé sur l'entrée standard (souvent vide)","sortie_attendue":"…"}]}`;
+  try {
+    const { parsed } = await chatWithFallback(ctx, { system, user: `${consigne ? `Indications : ${consigne}\n\n` : ''}${documentsBlock(fitted)}`, maxTokens: 6000, step: 'tests', label: 'Préparation des tests' });
+    const plan = arr(parsed.executions).filter((e) => e && e.code).slice(0, 5);
+    const out = [];
+    for (const [i, e] of plan.entries()) {
+      ctx.progress({ step: 'tests', message: `Exécution du test ${i + 1}/${plan.length} (${e.langage})…` });
+      const r = await runCode({ language: e.langage, code: str(e.code), stdin: str(e.entree), timeoutMs: 10000 });
+      out.push({ but: str(e.but), langage: r.language, code: str(e.code), entree: str(e.entree), sortie_attendue: str(e.sortie_attendue), stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode, timedOut: !!r.timedOut, unavailable: !!r.unavailable, ok: r.ok, durationMs: r.durationMs });
+    }
+    return out;
+  } catch (err) {
+    if (err.code === 'aborted' || err.status === 401) throw err;
+    ctx.notes.push(`Vérification par exécution impossible : ${err.message}`);
+    return [];
+  }
+}
+
+async function runCorrection(ctx, sources, consigne, executions = []) {
+  const { sources: fitted, truncated } = fitSources(sources, ctx.s.maxInputChars);
+  if (truncated) ctx.notes.push(`Les documents dépassent ${ctx.s.maxInputChars.toLocaleString('fr-FR')} caractères : certaines parties ont été tronquées (réglable dans les Paramètres).`);
+  const user = `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}Voici les ${fitted.length} document(s) fournis. Identifie l'énoncé, les réponses et l'éventuel barème, puis corrige.\n\n${documentsBlock(fitted)}${executionsBlock(executions)}\n\nRéponds uniquement avec l'objet JSON demandé.`;
+  const { parsed, model } = await chatWithFallback(ctx, { system: buildSystemPrompt(ctx.s), user });
+  const result = normalizeResult(parsed, ctx.s.gradeMax);
+  result.executions = executions;
+  return { result, model };
+}
+
+async function correct(ctx, { files, consigne, runCode }) {
+  const sources = await buildSources(files, ctx);
   if (!sources.length) throw new Error("Aucun contenu exploitable n'a pu être extrait des fichiers fournis.");
-  const out = await runCorrection({ client, sources, consigne, settings: s, progress, signal });
-  return { ...out, sources, warnings: [...warnings, ...out.warnings] };
+  const executions = await verifyByExecution(ctx, sources, consigne, runCode);
+  const out = await runCorrection(ctx, sources, consigne, executions);
+  return { ...out, sources, warnings: ctx.notes };
 }
 
-/** Relance une correction à partir des sources déjà transcrites (aucune nouvelle lecture d'image). */
-async function recorrect({ apiKey, sources, consigne, settings, progress = () => {}, signal, fetchImpl }) {
-  const s = { ...DEFAULTS, ...settings };
-  const client = new GroqClient(apiKey, { fetchImpl });
-  const out = await runCorrection({ client, sources, consigne, settings: s, progress, signal });
-  return { ...out, sources };
+async function recorrect(ctx, { sources, consigne, runCode }) {
+  const executions = await verifyByExecution(ctx, sources, consigne, runCode);
+  const out = await runCorrection(ctx, sources, consigne, executions);
+  return { ...out, sources, warnings: ctx.notes };
 }
 
-module.exports = { correct, recorrect, normalizeResult, buildName, fitSources, parseJsonLoose, buildSystemPrompt, DEFAULTS, EXERCISE_TYPES, TYPE_LABELS };
+// ---------------------------------------------------------------- Fiches de révision
+async function generateFlashcards(ctx, result) {
+  const system = `Tu crées des fiches de révision (flashcards) pour un étudiant en ${ctx.s.level}, à partir de ses erreurs.
+Chaque fiche : une question courte et précise au recto, une réponse claire au verso (avec exemple, formule LaTeX $…$ ou petit bloc de code si utile).
+Cible les notions mal maîtrisées, pas les détails anecdotiques. 4 à 10 fiches.
+Réponds UNIQUEMENT en JSON : {"fiches":[{"recto":"…","verso":"…","notion":"…"}]}`;
+  const user = `Exercice : ${result.titre} (${result.matiere})
+Fautes :
+${result.fautes.map((f) => `- [${f.gravite}] ${f.notion || f.categorie} : ${f.description} → ${f.correction}`).join('\n') || '(aucune)'}
+Notions à revoir :
+${result.a_revoir.map((a) => `- ${a.notion} : ${a.pourquoi}`).join('\n') || '(aucune)'}`;
+  const { parsed } = await chatWithFallback(ctx, { system, user, maxTokens: 4000, step: 'flashcards', label: 'Création des fiches' });
+  return arr(parsed.fiches).map((f) => ({ front: str(f.recto), back: str(f.verso), notion: str(f.notion) })).filter((f) => f.front && f.back);
+}
+
+// ---------------------------------------------------------------- Exercices d'entraînement
+async function generateExercise(ctx, { notions, matiere, type, difficulte = 'moyenne', consigne = '' }) {
+  const system = `Tu es enseignant en ${ctx.s.level}. Tu crées un exercice d'entraînement ORIGINAL ciblé sur des notions précises, pour qu'un étudiant progresse.
+L'exercice doit être faisable en 15 à 40 minutes, avec 2 à 5 questions progressives, un barème sur ${ctx.s.gradeMax} et des consignes claires (données, schéma de tables, signature de fonction attendue, etc.).
+Markdown, maths en LaTeX $…$, code dans des blocs \`\`\`.
+Réponds UNIQUEMENT en JSON : {"titre":"…","matiere":"…","type_exercice":"${EXERCISE_TYPES.join(' | ')}","langage":"…","notions":["…"],"enonce":"énoncé complet en Markdown avec le barème par question","format_reponse":"comment rédiger la réponse (texte, code, schéma…)"}`;
+  const user = `Notions à travailler : ${notions.join(', ')}
+Matière : ${matiere || 'au choix'}
+Type : ${type || 'au choix'}
+Difficulté : ${difficulte}
+${consigne ? `Demande particulière : ${consigne}` : ''}`;
+  const { parsed, model } = await chatWithFallback(ctx, { system, user, maxTokens: 5000, step: 'exercise', label: 'Création de l\'exercice' });
+  return {
+    titre: str(parsed.titre) || 'Exercice d\'entraînement',
+    matiere: str(parsed.matiere) || matiere || '',
+    type_exercice: EXERCISE_TYPES.includes(parsed.type_exercice) ? parsed.type_exercice : type || 'autre',
+    langage: str(parsed.langage),
+    notions: arr(parsed.notions).map(str),
+    enonce: str(parsed.enonce),
+    format_reponse: str(parsed.format_reponse),
+    difficulte,
+    model
+  };
+}
+
+module.exports = {
+  correct, recorrect, generateFlashcards, generateExercise, normalizeResult, buildName, fitSources, parseJsonLoose,
+  buildSystemPrompt, hasRunnableCode, DEFAULTS, EXERCISE_TYPES, TYPE_LABELS, VISION_PROMPT
+};

@@ -1,7 +1,7 @@
 {
   "name": "correcteur-intelligent",
   "productName": "Correcteur Intelligent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Correction intelligente d'exercices (BUT Informatique) par IA : maths manuscrits, code, bases de données, réseaux…",
   "main": "src/main/main.js",
   "author": "TomH0999",
@@ -14,13 +14,19 @@
     "dist:linux": "electron-builder --linux dir --publish never"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
+    "@tesseract.js-data/fra": "^1.0.0",
     "dompurify": "^3.4.17",
+    "electron-updater": "^6.8.11",
     "jszip": "^3.10.2",
     "katex": "^0.19.1",
     "mammoth": "^1.13.0",
     "marked": "^18.1.3",
     "pdfjs-dist": "^4.10.38",
+    "pyodide": "^314.0.7",
+    "qrcode": "^1.5.4",
     "sql.js": "^1.15.2",
+    "tesseract.js": "^7.0.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
@@ -43,7 +49,22 @@
     "files": [
       "src/**/*",
       "build/icon.png",
-      "package.json"
+      "package.json",
+      "!node_modules/@napi-rs/**",
+      "!node_modules/sql.js/dist/*.zip",
+      "!node_modules/sql.js/dist/*debug*",
+      "!node_modules/sql.js/dist/sql-asm*",
+      "!node_modules/sql.js/dist/worker*",
+      "!node_modules/sql.js/dist/*browser*",
+      "!node_modules/sql.js/dist/*inline*",
+      "!node_modules/@tesseract.js-data/fra/4.0.0/**",
+      "!node_modules/pdfjs-dist/legacy/**",
+      "!node_modules/pdfjs-dist/**/*.map",
+      "!node_modules/pdfjs-dist/web/**",
+      "!node_modules/pyodide/*.map",
+      "!node_modules/pyodide/console*.html",
+      "!**/*.d.ts",
+      "!**/*.d.mts"
     ],
     "asar": true,
     "win": {
@@ -69,7 +90,8 @@
         "fr_FR"
       ],
       "language": "1036",
-      "deleteAppDataOnUninstall": false
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": true
     },
     "linux": {
       "target": [
@@ -78,6 +100,21 @@
       "category": "Education",
       "icon": "build/icon.png"
     },
-    "publish": null
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "TomH0999",
+        "repo": "correcteur-intelligent",
+        "releaseType": "release"
+      }
+    ],
+    "asarUnpack": [
+      "src/main/runner-worker.js",
+      "node_modules/pyodide/**",
+      "node_modules/sql.js/**",
+      "node_modules/tesseract.js/**",
+      "node_modules/tesseract.js-core/**",
+      "node_modules/@tesseract.js-data/**"
+    ]
   }
 }

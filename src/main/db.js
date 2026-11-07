@@ -1,11 +1,17 @@
 'use strict';
 /**
- * Base de données locale (SQLite via sql.js / WebAssembly : aucune compilation native nécessaire).
- * Le fichier est stocké dans le dossier de données de l'utilisateur et réécrit à chaque modification.
+ * Base de données LOCALE de cette installation (SQLite via sql.js / WebAssembly).
+ * Le fichier est stocké dans le dossier de données de l'utilisateur Windows (%APPDATA%) :
+ * chaque installation a sa propre base, rien n'est partagé sans action explicite (sauvegarde / synchro).
  */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const initSqlJs = require('sql.js');
+
+const SCHEMA_VERSION = 2;
+// Intervalles de révision (jours) par boîte de Leitner
+const BOX_DAYS = [0, 1, 2, 4, 8, 16, 32, 64];
 
 function normalize(s) {
   return String(s || '')
@@ -14,21 +20,36 @@ function normalize(s) {
     .toLowerCase();
 }
 
+const uuid = () => crypto.randomUUID();
+const now = () => new Date().toISOString();
+
 class Database {
-  constructor(file) {
+  constructor(file, { onChange } = {}) {
     this.file = file;
     this.db = null;
+    this.onChange = onChange;
   }
 
   async open() {
     const wasmPath = require.resolve('sql.js/dist/sql-wasm.wasm');
     const SQL = await initSqlJs({ wasmBinary: fs.readFileSync(wasmPath) });
+    this.SQL = SQL;
     if (this.file && fs.existsSync(this.file)) {
       this.db = new SQL.Database(fs.readFileSync(this.file));
     } else {
       this.db = new SQL.Database();
     }
-    this.db.run(`
+    this.migrate();
+    this.persist(true);
+    return this;
+  }
+
+  columns(table) {
+    return this.all(`PRAGMA table_info(${table})`).map((c) => c.name);
+  }
+
+  migrate() {
+    this.x(`
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS folders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,25 +75,81 @@ class Database {
         model TEXT,
         search_text TEXT
       );
+      CREATE TABLE IF NOT EXISTS flashcards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uuid TEXT UNIQUE,
+        correction_id INTEGER REFERENCES corrections(id) ON DELETE SET NULL,
+        front TEXT NOT NULL,
+        back TEXT NOT NULL,
+        notion TEXT,
+        subject TEXT,
+        box INTEGER NOT NULL DEFAULT 0,
+        due_at TEXT NOT NULL,
+        last_review TEXT,
+        reviews INTEGER NOT NULL DEFAULT 0,
+        lapses INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS exercises (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uuid TEXT UNIQUE,
+        title TEXT NOT NULL,
+        subject TEXT,
+        exercise_type TEXT,
+        language TEXT,
+        notions TEXT,
+        statement TEXT NOT NULL,
+        answer_format TEXT,
+        difficulty TEXT,
+        source_correction_id INTEGER REFERENCES corrections(id) ON DELETE SET NULL,
+        done_correction_id INTEGER REFERENCES corrections(id) ON DELETE SET NULL,
+        draft TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+      );
+    `);
+    // v1 -> v2 : identifiants universels (fusion des sauvegardes), type de correction, date de modification
+    const add = (table, col, def) => {
+      if (!this.columns(table).includes(col)) this.x(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+    };
+    add('folders', 'uuid', 'TEXT');
+    add('folders', 'updated_at', 'TEXT');
+    add('corrections', 'uuid', 'TEXT');
+    add('corrections', 'kind', "TEXT DEFAULT 'correction'");
+    add('corrections', 'exercise_id', 'INTEGER');
+    add('corrections', 'updated_at', 'TEXT');
+    for (const t of ['folders', 'corrections', 'flashcards', 'exercises']) {
+      for (const r of this.all(`SELECT id FROM ${t} WHERE uuid IS NULL`)) this.x(`UPDATE ${t} SET uuid = ? WHERE id = ?`, [uuid(), r.id]);
+    }
+    this.x(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_uuid ON folders(uuid);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_corr_uuid ON corrections(uuid);
       CREATE INDEX IF NOT EXISTS idx_corr_folder ON corrections(folder_id);
       CREATE INDEX IF NOT EXISTS idx_corr_date ON corrections(created_at);
+      CREATE INDEX IF NOT EXISTS idx_cards_due ON flashcards(due_at);
     `);
-    this.persist();
-    return this;
+    this.x(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
 
-  persist() {
+  persist(silent = false) {
     if (!this.file) return;
     const data = Buffer.from(this.db.export());
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = this.file + '.tmp';
     fs.writeFileSync(tmp, data);
     fs.renameSync(tmp, this.file);
+    if (!silent) this.onChange?.();
+  }
+
+  /** sql.js refuse « undefined » : on le convertit en NULL. */
+  x(sql, params) {
+    this.db.run(sql, params ? params.map((v) => (v === undefined ? null : v)) : undefined);
   }
 
   all(sql, params = []) {
     const stmt = this.db.prepare(sql);
-    stmt.bind(params);
+    stmt.bind(params.map((v) => (v === undefined ? null : v)));
     const rows = [];
     while (stmt.step()) rows.push(stmt.getAsObject());
     stmt.free();
@@ -84,7 +161,7 @@ class Database {
   }
 
   run(sql, params = []) {
-    this.db.run(sql, params);
+    this.x(sql, params);
     const id = this.get('SELECT last_insert_rowid() AS id').id;
     this.persist();
     return id;
@@ -92,30 +169,28 @@ class Database {
 
   // ---------- Dossiers ----------
   listFolders() {
-    const folders = this.all('SELECT f.*, (SELECT COUNT(*) FROM corrections c WHERE c.folder_id = f.id) AS count FROM folders f ORDER BY name COLLATE NOCASE');
-    return folders;
+    return this.all('SELECT f.*, (SELECT COUNT(*) FROM corrections c WHERE c.folder_id = f.id) AS count FROM folders f ORDER BY name COLLATE NOCASE');
   }
 
   createFolder(name, parentId = null, color = null) {
     const clean = String(name || '').trim();
     if (!clean) throw new Error('Le nom du dossier est vide.');
-    return this.run('INSERT INTO folders (name, parent_id, color, created_at) VALUES (?, ?, ?, ?)', [clean, parentId || null, color, new Date().toISOString()]);
+    return this.run('INSERT INTO folders (name, parent_id, color, created_at, uuid, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [clean, parentId || null, color, now(), uuid(), now()]);
   }
 
   renameFolder(id, name) {
     const clean = String(name || '').trim();
     if (!clean) throw new Error('Le nom du dossier est vide.');
-    this.run('UPDATE folders SET name = ? WHERE id = ?', [clean, id]);
+    this.run('UPDATE folders SET name = ?, updated_at = ? WHERE id = ?', [clean, now(), id]);
   }
 
   moveFolder(id, parentId) {
-    // Empêche de déplacer un dossier dans l'un de ses descendants
     let cur = parentId;
     while (cur) {
       if (cur === id) throw new Error('Impossible de déplacer un dossier dans lui-même.');
       cur = this.get('SELECT parent_id FROM folders WHERE id = ?', [cur])?.parent_id;
     }
-    this.run('UPDATE folders SET parent_id = ? WHERE id = ?', [parentId || null, id]);
+    this.run('UPDATE folders SET parent_id = ?, updated_at = ? WHERE id = ?', [parentId || null, now(), id]);
   }
 
   /** Supprime un dossier : les corrections qu'il contient restent dans l'historique. */
@@ -125,25 +200,30 @@ class Database {
       for (const c of this.all('SELECT id FROM folders WHERE parent_id = ?', [ids[i]])) ids.push(c.id);
     }
     const ph = ids.map(() => '?').join(',');
-    this.db.run(`UPDATE corrections SET folder_id = NULL WHERE folder_id IN (${ph})`, ids);
-    this.db.run(`DELETE FROM folders WHERE id IN (${ph})`, ids);
+    this.x(`UPDATE corrections SET folder_id = NULL WHERE folder_id IN (${ph})`, ids);
+    this.x(`DELETE FROM folders WHERE id IN (${ph})`, ids);
     this.persist();
   }
 
   // ---------- Corrections ----------
+  static searchText(rec, r) {
+    return normalize([
+      rec.name, r.titre, r.matiere, r.type_exercice, r.langage, r.resume,
+      ...(r.mots_cles || []), ...(r.a_revoir || []).map((a) => a.notion), ...(r.fautes || []).map((f) => f.notion),
+      ...(rec.files || []).map((f) => f.name || f), rec.consigne
+    ].filter(Boolean).join(' '));
+  }
+
   saveCorrection(rec) {
     const r = rec.result || {};
-    const searchText = normalize([
-      rec.name, r.titre, r.matiere, r.type_exercice, r.langage, r.resume,
-      ...(r.mots_cles || []), ...(rec.files || []).map((f) => f.name || f), rec.consigne
-    ].filter(Boolean).join(' '));
     return this.run(
-      `INSERT INTO corrections (name, folder_id, created_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, exercise_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        rec.name, rec.folderId || null, rec.createdAt || new Date().toISOString(), r.matiere || null, r.type_exercice || null,
+        rec.uuid || uuid(), rec.name, rec.folderId || null, rec.createdAt || now(), now(), r.matiere || null, r.type_exercice || null,
         r.score_pourcentage ?? null, r.note?.obtenue ?? null, r.note?.sur ?? null,
-        JSON.stringify(rec.files || []), rec.consigne || '', JSON.stringify(r), JSON.stringify(rec.sources || []), rec.model || null, searchText
+        JSON.stringify(rec.files || []), rec.consigne || '', JSON.stringify(r), JSON.stringify(rec.sources || []), rec.model || null,
+        Database.searchText(rec, r), rec.kind || 'correction', rec.exerciseId || null
       ]
     );
   }
@@ -162,40 +242,40 @@ class Database {
     return this._hydrate(this.get('SELECT * FROM corrections WHERE id = ?', [id]));
   }
 
-  /**
-   * Liste les corrections.
-   * @param {object} q { folderId: number|'none'|undefined, search, type, limit, offset }
-   */
+  /** @param {object} q { folderId: number|'none', search, type, kind, limit, offset } */
   listCorrections(q = {}) {
     const where = [];
     const params = [];
     if (q.folderId === 'none') where.push('folder_id IS NULL');
     else if (q.folderId) { where.push('folder_id = ?'); params.push(q.folderId); }
     if (q.type) { where.push('exercise_type = ?'); params.push(q.type); }
+    if (q.kind) { where.push("COALESCE(kind, 'correction') = ?"); params.push(q.kind); }
+    if (q.subject) { where.push('subject = ?'); params.push(q.subject); }
     if (q.search) {
       for (const word of normalize(q.search).split(/\s+/).filter(Boolean)) {
         where.push("(search_text LIKE ? ESCAPE '\\')");
         params.push(`%${word.replace(/[\\%_]/g, (m) => '\\' + m)}%`);
       }
     }
-    const sql = `SELECT c.id, c.name, c.folder_id, c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.model,
+    const sql = `SELECT c.id, c.uuid, c.name, c.folder_id, c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.model, c.kind,
                         f.name AS folder_name
                  FROM corrections c LEFT JOIN folders f ON f.id = c.folder_id
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY c.created_at DESC LIMIT ? OFFSET ?`;
-    params.push(q.limit || 500, q.offset || 0);
+    params.push(q.limit || 1000, q.offset || 0);
     return this.all(sql, params).map((r) => ({ ...r, files: JSON.parse(r.files || '[]') }));
   }
 
   updateCorrection(id, patch) {
+    const row = this.getCorrection(id);
+    if (!row) throw new Error('Correction introuvable.');
     if (patch.name !== undefined) {
       const clean = String(patch.name).trim();
       if (!clean) throw new Error('Le nom est vide.');
-      const row = this.getCorrection(id);
-      const rest = row.search_text || '';
-      this.db.run('UPDATE corrections SET name = ?, search_text = ? WHERE id = ?', [clean, normalize(clean) + ' ' + rest, id]);
+      this.x('UPDATE corrections SET name = ?, search_text = ? WHERE id = ?', [clean, Database.searchText({ ...row, name: clean }, row.result), id]);
     }
-    if (patch.folderId !== undefined) this.db.run('UPDATE corrections SET folder_id = ? WHERE id = ?', [patch.folderId || null, id]);
+    if (patch.folderId !== undefined) this.x('UPDATE corrections SET folder_id = ? WHERE id = ?', [patch.folderId || null, id]);
+    this.x('UPDATE corrections SET updated_at = ? WHERE id = ?', [now(), id]);
     this.persist();
     return this.getCorrection(id);
   }
@@ -205,9 +285,251 @@ class Database {
   }
 
   stats() {
-    return this.get(`SELECT COUNT(*) AS total, ROUND(AVG(score), 1) AS avg_score,
-                     SUM(CASE WHEN folder_id IS NOT NULL THEN 1 ELSE 0 END) AS filed FROM corrections`);
+    return {
+      ...this.get(`SELECT COUNT(*) AS total, ROUND(AVG(score), 1) AS avg_score,
+                   SUM(CASE WHEN folder_id IS NOT NULL THEN 1 ELSE 0 END) AS filed FROM corrections`),
+      due: this.get('SELECT COUNT(*) AS n FROM flashcards WHERE due_at <= ?', [now()]).n,
+      cards: this.get('SELECT COUNT(*) AS n FROM flashcards').n
+    };
+  }
+
+  /** Données du tableau de bord de progression. */
+  dashboard() {
+    const rows = this.all('SELECT id, name, created_at, subject, exercise_type, score, result, kind FROM corrections ORDER BY created_at ASC');
+    const timeline = [];
+    const subjects = {};
+    const notions = {};
+    const categories = {};
+    for (const r of rows) {
+      const res = r.result ? JSON.parse(r.result) : {};
+      const subject = (r.subject || 'Sans matière').trim();
+      timeline.push({ id: r.id, date: r.created_at, score: r.score, subject, type: r.exercise_type, name: r.name, kind: r.kind || 'correction' });
+      const s = (subjects[subject] ||= { subject, count: 0, sum: 0, scores: [], last: null });
+      s.count++;
+      if (r.score != null) { s.sum += r.score; s.scores.push(r.score); }
+      s.last = r.created_at;
+      for (const f of res.fautes || []) {
+        const key = (f.notion || f.categorie || 'autre').trim();
+        const n = (notions[normalize(key)] ||= { notion: key, count: 0, majeures: 0, last: null, subjects: new Set() });
+        n.count++;
+        if (f.gravite === 'majeure') n.majeures++;
+        n.last = r.created_at;
+        n.subjects.add(subject);
+        categories[f.categorie || 'autre'] = (categories[f.categorie || 'autre'] || 0) + 1;
+      }
+      for (const a of res.a_revoir || []) {
+        const key = (a.notion || '').trim();
+        if (!key) continue;
+        const n = (notions[normalize(key)] ||= { notion: key, count: 0, majeures: 0, last: null, subjects: new Set() });
+        n.count += a.priorite === 'haute' ? 1 : 0.5;
+        n.last = r.created_at;
+        n.subjects.add(subject);
+      }
+    }
+    const bySubject = Object.values(subjects).map((s) => {
+      const half = Math.max(1, Math.floor(s.scores.length / 2));
+      const first = s.scores.slice(0, half);
+      const last = s.scores.slice(-half);
+      const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+      return { subject: s.subject, count: s.count, avg: avg(s.scores), trend: s.scores.length >= 2 ? avg(last) - avg(first) : null, last: s.last };
+    }).sort((a, b) => b.count - a.count);
+    const topNotions = Object.values(notions)
+      .map((n) => ({ ...n, subjects: [...n.subjects] }))
+      .sort((a, b) => b.count - a.count || b.majeures - a.majeures)
+      .slice(0, 15);
+    return {
+      timeline,
+      bySubject,
+      topNotions,
+      categories: Object.entries(categories).map(([categorie, count]) => ({ categorie, count })).sort((a, b) => b.count - a.count),
+      cards: this.get('SELECT COUNT(*) AS total, SUM(CASE WHEN due_at <= ? THEN 1 ELSE 0 END) AS due, SUM(CASE WHEN box >= 4 THEN 1 ELSE 0 END) AS mastered FROM flashcards', [now()]),
+      exercises: this.get('SELECT COUNT(*) AS total, SUM(CASE WHEN done_correction_id IS NOT NULL THEN 1 ELSE 0 END) AS done FROM exercises')
+    };
+  }
+
+  // ---------- Fiches de révision (répétition espacée, boîtes de Leitner) ----------
+  addFlashcards(cards, { correctionId = null, subject = null } = {}) {
+    const ts = now();
+    for (const c of cards) {
+      this.x('INSERT INTO flashcards (uuid, correction_id, front, back, notion, subject, box, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+        [uuid(), correctionId, c.front, c.back, c.notion || null, subject || c.subject || null, ts, ts, ts]);
+    }
+    this.persist();
+    return cards.length;
+  }
+
+  listFlashcards({ dueOnly = false, correctionId, search, limit = 500 } = {}) {
+    const where = [];
+    const params = [];
+    if (dueOnly) { where.push('due_at <= ?'); params.push(now()); }
+    if (correctionId) { where.push('correction_id = ?'); params.push(correctionId); }
+    if (search) { where.push('(front LIKE ? OR back LIKE ? OR notion LIKE ? OR subject LIKE ?)'); params.push(...Array(4).fill(`%${search}%`)); }
+    params.push(limit);
+    return this.all(`SELECT * FROM flashcards ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${dueOnly ? 'due_at ASC' : 'created_at DESC'} LIMIT ?`, params);
+  }
+
+  /** grade : 'again' | 'hard' | 'good' | 'easy' */
+  reviewFlashcard(id, grade, at = new Date()) {
+    const c = this.get('SELECT * FROM flashcards WHERE id = ?', [id]);
+    if (!c) throw new Error('Fiche introuvable.');
+    let box = c.box;
+    let due;
+    const day = 86400000;
+    if (grade === 'again') {
+      box = 1;
+      due = new Date(at.getTime() + 10 * 60000);
+    } else if (grade === 'hard') {
+      box = Math.max(1, box);
+      due = new Date(at.getTime() + Math.max(0.5, BOX_DAYS[box] / 2) * day);
+    } else {
+      box = Math.min(BOX_DAYS.length - 1, box + (grade === 'easy' ? 2 : 1));
+      due = new Date(at.getTime() + BOX_DAYS[box] * day);
+    }
+    this.x('UPDATE flashcards SET box = ?, due_at = ?, last_review = ?, reviews = reviews + 1, lapses = lapses + ?, updated_at = ? WHERE id = ?',
+      [box, due.toISOString(), at.toISOString(), grade === 'again' ? 1 : 0, now(), id]);
+    this.persist();
+    return this.get('SELECT * FROM flashcards WHERE id = ?', [id]);
+  }
+
+  updateFlashcard(id, { front, back }) {
+    this.run('UPDATE flashcards SET front = COALESCE(?, front), back = COALESCE(?, back), updated_at = ? WHERE id = ?', [front ?? null, back ?? null, now(), id]);
+  }
+
+  deleteFlashcard(id) {
+    this.run('DELETE FROM flashcards WHERE id = ?', [id]);
+  }
+
+  // ---------- Exercices d'entraînement ----------
+  saveExercise(ex, sourceCorrectionId = null) {
+    return this.run(`INSERT INTO exercises (uuid, title, subject, exercise_type, language, notions, statement, answer_format, difficulty, source_correction_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [uuid(), ex.titre, ex.matiere, ex.type_exercice, ex.langage, JSON.stringify(ex.notions || []), ex.enonce, ex.format_reponse, ex.difficulte, sourceCorrectionId, now(), now()]);
+  }
+
+  listExercises() {
+    return this.all('SELECT e.*, c.score AS done_score, c.grade AS done_grade, c.grade_max AS done_grade_max FROM exercises e LEFT JOIN corrections c ON c.id = e.done_correction_id ORDER BY e.created_at DESC')
+      .map((e) => ({ ...e, notions: JSON.parse(e.notions || '[]') }));
+  }
+
+  getExercise(id) {
+    const e = this.get('SELECT * FROM exercises WHERE id = ?', [id]);
+    return e ? { ...e, notions: JSON.parse(e.notions || '[]') } : null;
+  }
+
+  updateExercise(id, patch) {
+    if (patch.draft !== undefined) this.x('UPDATE exercises SET draft = ?, updated_at = ? WHERE id = ?', [patch.draft, now(), id]);
+    if (patch.doneCorrectionId !== undefined) this.x('UPDATE exercises SET done_correction_id = ?, updated_at = ? WHERE id = ?', [patch.doneCorrectionId, now(), id]);
+    this.persist();
+    return this.getExercise(id);
+  }
+
+  deleteExercise(id) {
+    this.run('DELETE FROM exercises WHERE id = ?', [id]);
+  }
+
+  // ---------- Sauvegarde / fusion ----------
+  exportAll() {
+    return {
+      schema: SCHEMA_VERSION,
+      folders: this.all('SELECT * FROM folders'),
+      corrections: this.all('SELECT * FROM corrections'),
+      flashcards: this.all('SELECT * FROM flashcards'),
+      exercises: this.all('SELECT * FROM exercises')
+    };
+  }
+
+  /**
+   * Fusionne une sauvegarde (d'un autre PC ou d'une ancienne version) sans doublon : les éléments sont
+   * reconnus par leur uuid ; pour un élément déjà présent, la version modifiée le plus récemment l'emporte.
+   */
+  mergeAll(data) {
+    const stats = { folders: 0, corrections: 0, flashcards: 0, exercises: 0, updated: 0 };
+    const newer = (a, b) => (a || '') > (b || '');
+    const folderMap = {};
+    const corrMap = {};
+    // Dossiers (parents d'abord)
+    const pending = [...(data.folders || [])];
+    let guard = 0;
+    while (pending.length && guard++ < 10000) {
+      const f = pending.shift();
+      const parent = data.folders.find((p) => p.id === f.parent_id);
+      if (parent && folderMap[parent.id] === undefined) { pending.push(f); continue; }
+      const local = f.uuid && this.get('SELECT * FROM folders WHERE uuid = ?', [f.uuid]);
+      if (local) {
+        folderMap[f.id] = local.id;
+        if (newer(f.updated_at, local.updated_at)) {
+          this.x('UPDATE folders SET name = ?, parent_id = ?, updated_at = ? WHERE id = ?', [f.name, parent ? folderMap[parent.id] : null, f.updated_at, local.id]);
+          stats.updated++;
+        }
+      } else {
+        this.x('INSERT INTO folders (uuid, name, parent_id, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+          [f.uuid || uuid(), f.name, parent ? folderMap[parent.id] : null, f.color, f.created_at, f.updated_at || f.created_at]);
+        folderMap[f.id] = this.get('SELECT last_insert_rowid() AS id').id;
+        stats.folders++;
+      }
+    }
+    for (const c of data.corrections || []) {
+      const local = c.uuid && this.get('SELECT id, updated_at FROM corrections WHERE uuid = ?', [c.uuid]);
+      const folderId = c.folder_id ? folderMap[c.folder_id] ?? null : null;
+      if (local) {
+        corrMap[c.id] = local.id;
+        if (newer(c.updated_at, local.updated_at)) {
+          this.x('UPDATE corrections SET name = ?, folder_id = ?, search_text = ?, updated_at = ? WHERE id = ?', [c.name, folderId, c.search_text, c.updated_at, local.id]);
+          stats.updated++;
+        }
+        continue;
+      }
+      this.x(`INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [c.uuid || uuid(), c.name, folderId, c.created_at, c.updated_at || c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.consigne, c.result, c.sources, c.model, c.search_text, c.kind || 'correction']);
+      corrMap[c.id] = this.get('SELECT last_insert_rowid() AS id').id;
+      stats.corrections++;
+    }
+    for (const f of data.flashcards || []) {
+      const local = f.uuid && this.get('SELECT id, updated_at FROM flashcards WHERE uuid = ?', [f.uuid]);
+      if (local) {
+        if (newer(f.updated_at, local.updated_at)) {
+          this.x('UPDATE flashcards SET front = ?, back = ?, box = ?, due_at = ?, last_review = ?, reviews = ?, lapses = ?, updated_at = ? WHERE id = ?',
+            [f.front, f.back, f.box, f.due_at, f.last_review, f.reviews, f.lapses, f.updated_at, local.id]);
+          stats.updated++;
+        }
+        continue;
+      }
+      this.x('INSERT INTO flashcards (uuid, correction_id, front, back, notion, subject, box, due_at, last_review, reviews, lapses, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [f.uuid || uuid(), corrMap[f.correction_id] ?? null, f.front, f.back, f.notion, f.subject, f.box, f.due_at, f.last_review, f.reviews, f.lapses, f.created_at, f.updated_at || f.created_at]);
+      stats.flashcards++;
+    }
+    for (const e of data.exercises || []) {
+      const local = e.uuid && this.get('SELECT id, updated_at FROM exercises WHERE uuid = ?', [e.uuid]);
+      if (local) {
+        if (newer(e.updated_at, local.updated_at)) {
+          this.x('UPDATE exercises SET draft = ?, done_correction_id = ?, updated_at = ? WHERE id = ?', [e.draft, corrMap[e.done_correction_id] ?? null, e.updated_at, local.id]);
+          stats.updated++;
+        }
+        continue;
+      }
+      this.x(`INSERT INTO exercises (uuid, title, subject, exercise_type, language, notions, statement, answer_format, difficulty, source_correction_id, done_correction_id, draft, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [e.uuid || uuid(), e.title, e.subject, e.exercise_type, e.language, e.notions, e.statement, e.answer_format, e.difficulty, corrMap[e.source_correction_id] ?? null, corrMap[e.done_correction_id] ?? null, e.draft, e.created_at, e.updated_at || e.created_at]);
+      stats.exercises++;
+    }
+    this.persist(true);
+    return stats;
+  }
+
+  /** Remplace entièrement la base (restauration). */
+  replaceWith(buffer) {
+    const test = new this.SQL.Database(buffer);
+    test.exec('SELECT COUNT(*) FROM corrections');
+    this.db.close();
+    this.db = test;
+    this.migrate();
+    this.persist(true);
+  }
+
+  rawExport() {
+    return Buffer.from(this.db.export());
   }
 }
 
-module.exports = { Database, normalize };
+module.exports = { Database, normalize, BOX_DAYS };
