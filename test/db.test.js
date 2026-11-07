@@ -88,3 +88,40 @@ test('exercices d\'entraînement', async () => {
   assert.equal(db.getExercise(id).draft, 'SELECT …');
   assert.deepEqual(db.listExercises()[0].notions, ['jointures']);
 });
+
+test('brouillons non comptés + réussite du premier coup et amélioration', async () => {
+  const db = await new Database(tmp()).open();
+  const enonce = { file: 'sujet.pdf', role: 'enonce', kind: 'pdf-page', text: 'Exercice 1 : écrire une requête SQL qui liste tous les clients de la table client.' };
+  const save = (score, answer, extra = {}) => db.saveCorrection({
+    name: `essai ${score}`,
+    result: normalizeResult({ titre: 'TD SQL', note: { obtenue: score / 5, sur: 20 }, identification: { enonce: ['sujet.pdf'] } }),
+    sources: [enonce, { file: 'copie.txt', role: 'auto', kind: 'text', text: answer }],
+    ...extra
+  });
+  // Exercice A : raté (40 %) puis réussi (80 %), avec une re-correction de la 1re copie qui ne compte pas en plus
+  const a1 = save(40, 'SELECT nom FROM client WHERE ville = 1');
+  save(45, 'SELECT nom FROM client WHERE ville = 1');
+  const a2 = save(80, 'SELECT nom FROM client');
+  // Brouillon : ignoré partout
+  save(10, 'brouillon', { counted: false });
+  // Exercice B (autre énoncé) : réussi du premier coup
+  db.saveCorrection({ name: 'B', result: normalizeResult({ titre: 'Maths', note: { obtenue: 15, sur: 20 } }), sources: [{ file: 'b.txt', role: 'enonce', kind: 'text', text: 'Calculer la dérivée de la fonction f définie sur R par f(x) = x au carré.' }, { file: 'r.txt', kind: 'text', role: 'reponse', text: '2x' }] });
+  assert.equal(db.listCorrections().length, 4);
+  assert.equal(db.listCorrections({ drafts: true }).length, 1);
+  assert.equal(db.stats().drafts, 1);
+  const st = db.attemptStats();
+  assert.equal(st.exercises, 2);
+  assert.equal(st.firstTryRate, 50);
+  const sA = st.series.find((s) => s.count === 2);
+  assert.equal(sA.first, 45); // la re-correction remplace la note de la 1re tentative
+  assert.equal(sA.improvement, 35);
+  assert.equal(st.avgImprovement, 35);
+  assert.equal(st.recoveredRate, 100);
+  assert.equal(db.attemptsFor(a2).index, 1);
+  assert.equal(db.dashboard().timeline.length, 4);
+  // Détacher puis relier
+  db.updateCorrection(a2, { exerciseKey: null });
+  assert.equal(db.attemptStats().exercises, 3);
+  db.updateCorrection(a2, { exerciseKey: db.getCorrection(a1).exercise_key });
+  assert.equal(db.attemptStats().exercises, 2);
+});

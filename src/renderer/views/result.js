@@ -34,6 +34,7 @@ function render(root, rec) {
       <button class="btn sm danger" id="r-del" title="Supprimer"><i class="fa-solid fa-trash-can"></i></button>
     </div>
 
+    ${rec.counted ? '' : `<div class="banner warn no-print"><i class="fa-solid fa-file-pen"></i><span><strong>Brouillon :</strong> cette correction n'est pas enregistrée. Elle n'apparaît pas dans l'historique et ne compte ni dans tes statistiques ni dans ta progression. Elle sera supprimée automatiquement dans 14 jours.</span><span class="spacer"></span><button class="btn sm primary" id="r-keep"><i class="fa-solid fa-floppy-disk"></i>Enregistrer</button></div>`}
     <div class="card result-head">
       <div class="score">${ring(r.score_pourcentage)}
         <div class="score-txt"><div class="grade">${fr(r.note.obtenue)}<span>/${r.note.sur}</span></div><div class="pct">${fr(r.score_pourcentage, 1)} %</div></div>
@@ -59,6 +60,7 @@ function render(root, rec) {
       </div>
     </div>
 
+    <div id="r-attempts" class="no-print"></div>
     <nav class="tabs no-print">
       <a href="#sec-synthese">Synthèse</a><a href="#sec-questions">Questions</a><a href="#sec-fautes">Fautes (${r.fautes.length})</a>
       ${ex.length ? '<a href="#sec-exec">Exécution du code</a>' : ''}
@@ -189,6 +191,13 @@ function bind(root, rec) {
   const r = rec.result;
   $('#r-back', root).onclick = back;
   $('#r-folder', root).onclick = () => chooseFolder(rec);
+  $('#r-keep', root)?.addEventListener('click', async () => {
+    await api.update(rec.id, { counted: true });
+    toast('Correction enregistrée : elle compte maintenant dans ton historique et tes statistiques.', 'ok', 5000);
+    refreshStats();
+    go('result', { id: rec.id });
+  });
+  renderAttempts(root, rec);
   $('#r-rename', root).onclick = async () => {
     const name = await promptText('Renommer la correction', rec.name, 'Nom (utilisé pour la recherche dans l\'historique)');
     if (!name) return;
@@ -250,6 +259,56 @@ function bind(root, rec) {
     $(a.getAttribute('href'), root).scrollIntoView({ behavior: 'smooth', block: 'start' });
   }));
   void r;
+}
+
+// ---------- Tentatives du même exercice ----------
+async function renderAttempts(root, rec) {
+  const box = $('#r-attempts', root);
+  if (!rec.counted) {
+    box.innerHTML = '';
+    return;
+  }
+  const s = await api.attempts(rec.id);
+  const choices = await api.seriesChoices(rec.id);
+  const others = choices.filter((c) => c.key !== rec.exercise_key);
+  const linkUi = `
+    <div class="row wrap" style="margin-top:10px">
+      <select id="r-link" style="max-width:420px"><option value="">Lier à un autre exercice (même énoncé)…</option>${others.map((c) => `<option value="${esc(c.key)}">${esc(c.title)}${c.subject ? ` — ${esc(c.subject)}` : ''} (${c.count} tentative${c.count > 1 ? 's' : ''})</option>`).join('')}</select>
+      ${s && s.count > 1 ? '<button class="btn sm ghost" id="r-unlink"><i class="fa-solid fa-link-slash"></i>Détacher de cette série</button>' : ''}
+    </div>`;
+  if (!s || s.count < 2) {
+    box.innerHTML = `<div class="card tight" style="margin-top:16px"><div class="row wrap small muted"><i class="fa-solid fa-repeat"></i><span>Première tentative de cet exercice. Les prochaines copies du même énoncé seront regroupées automatiquement pour mesurer ta progression.</span></div>${others.length ? linkUi : ''}</div>`;
+  } else {
+    const k = s.index + 1;
+    const first = s.attempts[0];
+    const delta = rec.score != null && s.index > 0 ? rec.score - first.score : null;
+    box.innerHTML = `
+      <div class="card tight" style="margin-top:16px">
+        <div class="row wrap">
+          <span class="badge brand"><i class="fa-solid fa-repeat"></i>Tentative ${k} sur ${s.count}</span>
+          <span class="small muted">1re tentative : <strong style="color:${scoreColor(first.score)}">${fr(first.score, 1)} %</strong> ${first.score >= 50 ? '(réussie du premier coup)' : '(non réussie)'}</span>
+          ${delta != null ? `<span class="delta ${delta >= 0 ? 'up' : 'down'}">${delta >= 0 ? '+' : ''}${fr(delta, 1)} pts depuis la 1re</span>` : ''}
+          ${s.improvement != null ? `<span class="small muted">· progression totale de la série : <span class="delta ${s.improvement >= 0 ? 'up' : 'down'}">${s.improvement >= 0 ? '+' : ''}${fr(s.improvement, 1)} pts</span></span>` : ''}
+        </div>
+        <div class="attempt-track">${s.attempts.map((a, i) => `
+          <button class="attempt ${a.id === rec.id ? 'current' : ''}" data-open="${a.id}" title="${new Date(a.date).toLocaleString('fr-FR')}">
+            <span class="xs dim">n°${i + 1}</span><b style="color:${scoreColor(a.score)}">${fr(a.grade)}/${a.gradeMax}</b>
+          </button>${i < s.attempts.length - 1 ? `<i class="fa-solid fa-arrow-right dim"></i>` : ''}`).join('')}</div>
+        ${linkUi}
+      </div>`;
+  }
+  $$('[data-open]', box).forEach((b) => (b.onclick = () => go('result', { id: Number(b.dataset.open) })));
+  $('#r-link', box)?.addEventListener('change', async (e) => {
+    if (!e.target.value) return;
+    await api.update(rec.id, { exerciseKey: e.target.value });
+    toast('Correction rattachée à cet exercice.', 'ok');
+    go('result', { id: rec.id });
+  });
+  $('#r-unlink', box)?.addEventListener('click', async () => {
+    await api.update(rec.id, { exerciseKey: null });
+    toast('Correction détachée : elle forme maintenant un exercice à part.', 'info');
+    go('result', { id: rec.id });
+  });
 }
 
 // ---------- Discussion avec l'IA ----------
@@ -326,7 +385,8 @@ async function chooseFolder(rec) {
   try {
     if (newName) folderId = await api.createFolder(newName, folderId);
     const name = $('#m-name', b).value.trim();
-    await api.update(rec.id, { folderId, ...(name && name !== rec.name ? { name } : {}) });
+    // Classer une correction l'enregistre (un brouillon rangé dans un dossier devient « compté »)
+    await api.update(rec.id, { folderId, ...(folderId ? { counted: true } : {}), ...(name && name !== rec.name ? { name } : {}) });
     state.folders = await api.folders();
     toast(folderId ? 'Correction enregistrée dans le dossier.' : 'Correction retirée du dossier.', 'ok');
     refreshStats();

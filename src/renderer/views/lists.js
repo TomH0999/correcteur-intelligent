@@ -15,7 +15,7 @@ function historyTemplate() {
     <div class="filters">
       <input id="h-search" type="search" placeholder="Rechercher par nom, matière, notion, langage, fichier…" />
       <select id="h-type"><option value="">Tous les types</option>${Object.entries(TYPE_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
-      <select id="h-scope"><option value="">Toutes</option><option value="none">Non classées</option><option value="practice">Entraînements</option></select>
+      <select id="h-scope"><option value="">Toutes</option><option value="none">Non classées</option><option value="practice">Entraînements</option><option value="drafts">Brouillons (non enregistrés)</option></select>
     </div>
     <div id="h-compare" class="banner info hidden"><i class="fa-solid fa-code-compare"></i><span id="h-compare-txt"></span><span class="spacer"></span><button class="btn sm primary" id="h-compare-go">Comparer</button><button class="btn sm ghost" id="h-compare-clear">Annuler</button></div>
     <div id="h-list" class="list"></div>`;
@@ -25,7 +25,7 @@ async function loadHistory() {
   const search = $('#h-search').value.trim();
   const type = $('#h-type').value;
   const scope = $('#h-scope').value;
-  const rows = await api.list({ search, type, folderId: scope === 'none' ? 'none' : undefined, kind: scope === 'practice' ? 'practice' : undefined });
+  const rows = await api.list({ search, type, folderId: scope === 'none' ? 'none' : undefined, kind: scope === 'practice' ? 'practice' : undefined, drafts: scope === 'drafts' });
   const list = $('#h-list');
   if (!rows.length) {
     list.innerHTML = emptyState('fa-clock-rotate-left', search ? 'Aucun résultat pour cette recherche.' : 'Aucune correction pour le moment. Lance ta première correction !');

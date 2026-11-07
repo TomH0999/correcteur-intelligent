@@ -35,6 +35,9 @@ function template() {
       <label class="check" style="margin-right:auto" title="Pratique pour corriger plusieurs copies (TP de groupe, plusieurs essais) avec le même sujet">
         <input type="checkbox" id="batch-mode" /><span>Une copie par fichier<small>Chaque fichier « Mes réponses » est corrigé séparément avec l'énoncé et le barème marqués.</small></span>
       </label>
+      <label class="check" title="Décoche pour un simple brouillon : la correction s'affiche mais n'est comptée ni dans l'historique, ni dans tes statistiques, ni dans tes fiches.">
+        <input type="checkbox" id="save-correction" checked /><span>Enregistrer<small>Décoche pour un brouillon</small></span>
+      </label>
       <button class="btn ghost" id="btn-clear"><i class="fa-solid fa-trash-can"></i>Tout effacer</button>
       <button class="btn" id="btn-queue" disabled title="La correction se fait en arrière-plan : tu peux continuer à utiliser l'application ou la fermer, elle reprendra au prochain lancement."><i class="fa-solid fa-list-check"></i>Ajouter à la file d'attente</button>
       <button class="btn primary big" id="btn-correct" disabled><i class="fa-solid fa-wand-magic-sparkles"></i><span>Lancer la correction</span></button>
@@ -183,10 +186,11 @@ async function runCorrection() {
     $('#progress-bar').style.width = `${pct}%`;
   });
   try {
-    const { id, warnings } = await api.correct({ files: payload, consigne: $('#consigne').value.trim(), previews });
+    const { id, warnings } = await api.correct({ files: payload, consigne: $('#consigne').value.trim(), previews, counted: $('#save-correction').checked });
     warnings?.forEach((w) => toast(w, 'warn', 9000));
     files.length = 0;
     $('#consigne').value = '';
+    $('#save-correction').checked = true; // la prochaine correction est enregistrée par défaut
     renderFiles();
     go('result', { id });
   } catch (err) {
@@ -203,15 +207,16 @@ async function runCorrection() {
 function buildJobs() {
   const ready = files.filter((f) => f.status === 'ready');
   const consigne = $('#consigne').value.trim();
+  const counted = $('#save-correction').checked;
   const toPayload = (f) => ({ name: f.name, role: f.role, parts: f.parts });
   if (!$('#batch-mode').checked) {
-    return [{ title: ready.map((f) => f.name).join(', '), files: ready.map(toPayload), consigne, previews: ready.flatMap((f) => (f.role === 'enonce' ? [] : f.previews)) }];
+    return [{ title: ready.map((f) => f.name).join(', '), files: ready.map(toPayload), consigne, counted, previews: ready.flatMap((f) => (f.role === 'enonce' ? [] : f.previews)) }];
   }
   const shared = ready.filter((f) => f.role === 'enonce' || f.role === 'bareme');
   const copies = ready.filter((f) => f.role === 'reponse' || f.role === 'auto');
   if (!shared.some((f) => f.role === 'enonce')) throw new Error('Mode « une copie par fichier » : indique quel fichier est l\'énoncé (menu « 📋 Énoncé »).');
   if (!copies.length) throw new Error('Aucune copie à corriger : marque les fichiers de réponses en « ✍️ Mes réponses ».');
-  return copies.map((c) => ({ title: c.name, files: [...shared.map(toPayload), { ...toPayload(c), role: 'reponse' }], consigne, previews: c.previews }));
+  return copies.map((c) => ({ title: c.name, files: [...shared.map(toPayload), { ...toPayload(c), role: 'reponse' }], consigne, counted, previews: c.previews }));
 }
 
 async function addToQueue() {
@@ -227,6 +232,7 @@ async function addToQueue() {
     toast(`${jobs.length} correction(s) ajoutée(s) à la file d'attente.`, 'ok', 5000, { label: 'Voir', onClick: () => go('queue') });
     files.length = 0;
     $('#consigne').value = '';
+    $('#save-correction').checked = true;
     renderFiles();
   } catch (err) {
     toast(err.message, 'error', 8000);

@@ -37,6 +37,8 @@ contextBridge.exposeInMainWorld('api', {
   update: (id, patch) => invoke('db:update', id, patch),
   remove: (id) => invoke('db:delete', id),
   stats: () => invoke('db:stats'),
+  attempts: (id) => invoke('db:attempts', id),
+  seriesChoices: (id) => invoke('db:seriesChoices', id),
   dashboard: () => invoke('db:dashboard'),
   // Fiches de révision
   cards: (q) => invoke('cards:list', q),

@@ -490,3 +490,10 @@ pre { background: var(--s950); border: 1px solid var(--s800); padding: 10px 12px
 /* ---------- Réinitialisation ---------- */
 .danger-zone { border-color: rgb(244 63 94 / .35); }
 .danger-zone h2 > i { color: var(--rose); }
+
+/* ---------- Tentatives ---------- */
+.attempt-track { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.attempt { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 70px; padding: 6px 10px; border-radius: 10px; background: var(--s950); border: 1px solid var(--s800); color: var(--s200); font: inherit; cursor: pointer; }
+.attempt b { font-family: ui-monospace, Consolas, monospace; font-size: 14px; }
+.attempt:hover { border-color: rgb(59 130 246 / .5); }
+.attempt.current { border-color: var(--brand500); background: rgb(37 99 235 / .12); }

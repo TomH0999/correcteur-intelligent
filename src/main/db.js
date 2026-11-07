@@ -9,7 +9,9 @@ const path = require('path');
 const crypto = require('crypto');
 const initSqlJs = require('sql.js');
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
+// Une copie est « réussie » à partir de 50 % (10/20)
+const SUCCESS_THRESHOLD = 50;
 // Intervalles de révision (jours) par boîte de Leitner
 const BOX_DAYS = [0, 1, 2, 4, 8, 16, 32, 64];
 
@@ -122,6 +124,10 @@ class Database {
     // v3 : pages de la copie (annotations), discussion avec l'IA, file d'attente
     add('corrections', 'pages', 'TEXT');
     add('corrections', 'annotations', 'TEXT');
+    // v4 : brouillons (non comptés) et regroupement des tentatives d'un même exercice
+    add('corrections', 'counted', 'INTEGER NOT NULL DEFAULT 1');
+    add('corrections', 'exercise_key', 'TEXT');
+    add('corrections', 'answer_hash', 'TEXT');
     this.x(`
       CREATE TABLE IF NOT EXISTS chat_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,7 +164,16 @@ class Database {
       CREATE INDEX IF NOT EXISTS idx_corr_folder ON corrections(folder_id);
       CREATE INDEX IF NOT EXISTS idx_corr_date ON corrections(created_at);
       CREATE INDEX IF NOT EXISTS idx_cards_due ON flashcards(due_at);
+      CREATE INDEX IF NOT EXISTS idx_corr_key ON corrections(exercise_key);
     `);
+    // Empreintes des corrections existantes (tentatives regroupées automatiquement)
+    for (const r of this.all('SELECT id, result, sources, exercise_id FROM corrections WHERE exercise_key IS NULL')) {
+      try {
+        const ex = r.exercise_id ? this.get('SELECT uuid FROM exercises WHERE id = ?', [r.exercise_id]) : null;
+        const fp = Database.fingerprints({ result: JSON.parse(r.result || '{}'), sources: JSON.parse(r.sources || '[]'), exerciseUuid: ex?.uuid });
+        this.x('UPDATE corrections SET exercise_key = ?, answer_hash = ? WHERE id = ?', [fp.exerciseKey, fp.answerHash, r.id]);
+      } catch { /* ignore */ }
+    }
     this.x(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
 
@@ -244,16 +259,38 @@ class Database {
     ].filter(Boolean).join(' '));
   }
 
+  /**
+   * Empreintes d'une correction :
+   *  - exerciseKey : identifie l'EXERCICE (même énoncé => tentatives regroupées) ;
+   *  - answerHash  : identifie la RÉPONSE (une re-correction de la même copie n'est pas une nouvelle tentative).
+   */
+  static fingerprints({ result = {}, sources = [], exerciseUuid = null }) {
+    const strong = (s) => normalize(s).replace(/[^a-z0-9]/g, '');
+    const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 20);
+    const enonceFiles = new Set(result.identification?.enonce || []);
+    const isEnonce = (s) => s.role === 'enonce' || s.kind === 'generated' || enonceFiles.has(s.file);
+    // Seul le texte stable (pas les transcriptions d'images, qui varient d'une lecture à l'autre)
+    const enonceText = strong(sources.filter((s) => isEnonce(s) && !['image', 'audio'].includes(s.kind)).map((s) => s.text).join('\n'));
+    let exerciseKey;
+    if (exerciseUuid) exerciseKey = `x:${exerciseUuid}`;
+    else if (enonceText.length >= 40) exerciseKey = `e:${sha(enonceText.slice(0, 6000))}`;
+    else exerciseKey = `t:${sha(strong(`${result.titre || ''}|${result.matiere || ''}`))}`;
+    const answerHash = sha(strong(sources.filter((s) => !isEnonce(s)).map((s) => s.text).join('\n')) || String(Math.random()));
+    return { exerciseKey, answerHash };
+  }
+
   saveCorrection(rec) {
     const r = rec.result || {};
+    const fp = Database.fingerprints({ result: r, sources: rec.sources || [], exerciseUuid: rec.exerciseUuid });
     return this.run(
-      `INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, exercise_id, pages)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, exercise_id, pages, counted, exercise_key, answer_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         rec.uuid || uuid(), rec.name, rec.folderId || null, rec.createdAt || now(), now(), r.matiere || null, r.type_exercice || null,
         r.score_pourcentage ?? null, r.note?.obtenue ?? null, r.note?.sur ?? null,
         JSON.stringify(rec.files || []), rec.consigne || '', JSON.stringify(r), JSON.stringify(rec.sources || []), rec.model || null,
-        Database.searchText(rec, r), rec.kind || 'correction', rec.exerciseId || null, rec.pages ? JSON.stringify(rec.pages) : null
+        Database.searchText(rec, r), rec.kind || 'correction', rec.exerciseId || null, rec.pages ? JSON.stringify(rec.pages) : null,
+        rec.counted === false ? 0 : 1, rec.exerciseKey || fp.exerciseKey, fp.answerHash
       ]
     );
   }
@@ -283,13 +320,16 @@ class Database {
     if (q.type) { where.push('exercise_type = ?'); params.push(q.type); }
     if (q.kind) { where.push("COALESCE(kind, 'correction') = ?"); params.push(q.kind); }
     if (q.subject) { where.push('subject = ?'); params.push(q.subject); }
+    // Brouillons : exclus par défaut (non comptés)
+    if (q.drafts) where.push('counted = 0');
+    else if (!q.all) where.push('counted = 1');
     if (q.search) {
       for (const word of normalize(q.search).split(/\s+/).filter(Boolean)) {
         where.push("(search_text LIKE ? ESCAPE '\\')");
         params.push(`%${word.replace(/[\\%_]/g, (m) => '\\' + m)}%`);
       }
     }
-    const sql = `SELECT c.id, c.uuid, c.name, c.folder_id, c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.model, c.kind,
+    const sql = `SELECT c.id, c.uuid, c.name, c.folder_id, c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.model, c.kind, c.counted, c.exercise_key,
                         f.name AS folder_name
                  FROM corrections c LEFT JOIN folders f ON f.id = c.folder_id
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
@@ -307,6 +347,11 @@ class Database {
       this.x('UPDATE corrections SET name = ?, search_text = ? WHERE id = ?', [clean, Database.searchText({ ...row, name: clean }, row.result), id]);
     }
     if (patch.folderId !== undefined) this.x('UPDATE corrections SET folder_id = ? WHERE id = ?', [patch.folderId || null, id]);
+    if (patch.counted !== undefined) this.x('UPDATE corrections SET counted = ? WHERE id = ?', [patch.counted ? 1 : 0, id]);
+    if (patch.exerciseKey !== undefined) {
+      // null = détacher : l'exercice redevient une série à part
+      this.x('UPDATE corrections SET exercise_key = ? WHERE id = ?', [patch.exerciseKey || `u:${row.uuid}`, id]);
+    }
     this.x('UPDATE corrections SET updated_at = ? WHERE id = ?', [now(), id]);
     this.persist();
     return this.getCorrection(id);
@@ -319,7 +364,8 @@ class Database {
   stats() {
     return {
       ...this.get(`SELECT COUNT(*) AS total, ROUND(AVG(score), 1) AS avg_score,
-                   SUM(CASE WHEN folder_id IS NOT NULL THEN 1 ELSE 0 END) AS filed FROM corrections`),
+                   SUM(CASE WHEN folder_id IS NOT NULL THEN 1 ELSE 0 END) AS filed FROM corrections WHERE counted = 1`),
+      drafts: this.get('SELECT COUNT(*) AS n FROM corrections WHERE counted = 0').n,
       due: this.get('SELECT COUNT(*) AS n FROM flashcards WHERE due_at <= ?', [now()]).n,
       cards: this.get('SELECT COUNT(*) AS n FROM flashcards').n
     };
@@ -327,7 +373,7 @@ class Database {
 
   /** Données du tableau de bord de progression. */
   dashboard() {
-    const rows = this.all('SELECT id, name, created_at, subject, exercise_type, score, result, kind FROM corrections ORDER BY created_at ASC');
+    const rows = this.all('SELECT id, name, created_at, subject, exercise_type, score, result, kind FROM corrections WHERE counted = 1 ORDER BY created_at ASC');
     const timeline = [];
     const subjects = {};
     const notions = {};
@@ -375,8 +421,92 @@ class Database {
       topNotions,
       categories: Object.entries(categories).map(([categorie, count]) => ({ categorie, count })).sort((a, b) => b.count - a.count),
       cards: this.get('SELECT COUNT(*) AS total, SUM(CASE WHEN due_at <= ? THEN 1 ELSE 0 END) AS due, SUM(CASE WHEN box >= 4 THEN 1 ELSE 0 END) AS mastered FROM flashcards', [now()]),
-      exercises: this.get('SELECT COUNT(*) AS total, SUM(CASE WHEN done_correction_id IS NOT NULL THEN 1 ELSE 0 END) AS done FROM exercises')
+      exercises: this.get('SELECT COUNT(*) AS total, SUM(CASE WHEN done_correction_id IS NOT NULL THEN 1 ELSE 0 END) AS done FROM exercises'),
+      attempts: this.attemptStats()
     };
+  }
+
+  // ---------- Tentatives : réussite du premier coup et amélioration ----------
+  /**
+   * Séries de tentatives (corrections ENREGISTRÉES d'un même exercice, dans l'ordre chronologique).
+   * Les re-corrections d'une même copie (même réponse) ne comptent que pour une tentative : on garde la dernière note.
+   */
+  attemptSeries() {
+    const rows = this.all(`SELECT id, name, created_at, score, grade, grade_max, subject, exercise_key, answer_hash, result FROM corrections
+                           WHERE counted = 1 AND score IS NOT NULL AND exercise_key IS NOT NULL ORDER BY created_at ASC, id ASC`);
+    const series = new Map();
+    for (const r of rows) {
+      const s = series.get(r.exercise_key) || { key: r.exercise_key, attempts: [] };
+      const last = s.attempts[s.attempts.length - 1];
+      const att = { id: r.id, date: r.created_at, score: r.score, grade: r.grade, gradeMax: r.grade_max, answer: r.answer_hash };
+      if (last && last.answer === r.answer_hash) Object.assign(last, att); // re-correction de la même réponse
+      else s.attempts.push(att);
+      let title = r.name;
+      try { title = JSON.parse(r.result).titre || r.name; } catch { /* ignore */ }
+      s.title = title;
+      s.subject = r.subject;
+      series.set(r.exercise_key, s);
+    }
+    return [...series.values()].map((s) => {
+      const first = s.attempts[0];
+      const last = s.attempts[s.attempts.length - 1];
+      const best = Math.max(...s.attempts.map((a) => a.score));
+      return {
+        ...s,
+        count: s.attempts.length,
+        first: first.score,
+        last: last.score,
+        best,
+        firstSuccess: first.score >= SUCCESS_THRESHOLD,
+        finalSuccess: last.score >= SUCCESS_THRESHOLD,
+        improvement: s.attempts.length > 1 ? last.score - first.score : null,
+        lastDate: last.date
+      };
+    }).sort((a, b) => (b.lastDate || '').localeCompare(a.lastDate || ''));
+  }
+
+  attemptStats() {
+    const series = this.attemptSeries();
+    const multi = series.filter((s) => s.count > 1);
+    const pct = (n, d) => (d ? Math.round((n / d) * 1000) / 10 : null);
+    const failedFirst = series.filter((s) => !s.firstSuccess);
+    return {
+      threshold: SUCCESS_THRESHOLD,
+      exercises: series.length,
+      firstTryRate: pct(series.filter((s) => s.firstSuccess).length, series.length),
+      avgFirstScore: series.length ? Math.round((series.reduce((t, s) => t + s.first, 0) / series.length) * 10) / 10 : null,
+      reworked: multi.length,
+      avgImprovement: multi.length ? Math.round((multi.reduce((t, s) => t + s.improvement, 0) / multi.length) * 10) / 10 : null,
+      improvedRate: pct(multi.filter((s) => s.improvement > 0).length, multi.length),
+      // Parmi les exercices ratés du premier coup : combien sont réussis à la dernière tentative ?
+      recoveredRate: pct(failedFirst.filter((s) => s.finalSuccess).length, failedFirst.length),
+      finalRate: pct(series.filter((s) => s.finalSuccess).length, series.length),
+      series: series.slice(0, 50)
+    };
+  }
+
+  /** Tentatives de l'exercice d'une correction (pour la page de résultat). */
+  attemptsFor(id) {
+    const row = this.get('SELECT exercise_key FROM corrections WHERE id = ?', [id]);
+    if (!row?.exercise_key) return null;
+    const s = this.attemptSeries().find((x) => x.key === row.exercise_key);
+    if (!s) return null;
+    return { ...s, index: s.attempts.findIndex((a) => a.id === id) };
+  }
+
+  /** Corrections enregistrées proposées pour « lier à un exercice » (une par série). */
+  seriesChoices(excludeId) {
+    return this.attemptSeries().filter((s) => !s.attempts.some((a) => a.id === excludeId) || s.count > 1).map((s) => ({ key: s.key, title: s.title, subject: s.subject, count: s.count, last: s.lastDate }));
+  }
+
+  /** Brouillons plus vieux que N jours : supprimés (renvoie les dossiers de pages à nettoyer). */
+  purgeDrafts(days = 14) {
+    const limit = new Date(Date.now() - days * 86400000).toISOString();
+    const rows = this.all('SELECT id, pages FROM corrections WHERE counted = 0 AND created_at < ?', [limit]);
+    if (!rows.length) return [];
+    this.x(`DELETE FROM corrections WHERE id IN (${rows.map(() => '?').join(',')})`, rows.map((r) => r.id));
+    this.persist();
+    return rows.map((r) => (JSON.parse(r.pages || '[]')[0]?.img || '').split('/')[1]).filter(Boolean);
   }
 
   // ---------- Fiches de révision (répétition espacée, boîtes de Leitner) ----------
@@ -579,14 +709,14 @@ class Database {
       if (local) {
         corrMap[c.id] = local.id;
         if (newer(c.updated_at, local.updated_at)) {
-          this.x('UPDATE corrections SET name = ?, folder_id = ?, search_text = ?, updated_at = ? WHERE id = ?', [c.name, folderId, c.search_text, c.updated_at, local.id]);
+          this.x('UPDATE corrections SET name = ?, folder_id = ?, search_text = ?, counted = ?, exercise_key = COALESCE(?, exercise_key), updated_at = ? WHERE id = ?', [c.name, folderId, c.search_text, c.counted ?? 1, c.exercise_key ?? null, c.updated_at, local.id]);
           stats.updated++;
         }
         continue;
       }
-      this.x(`INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, pages, annotations)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.uuid || uuid(), c.name, folderId, c.created_at, c.updated_at || c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.consigne, c.result, c.sources, c.model, c.search_text, c.kind || 'correction', c.pages, c.annotations]);
+      this.x(`INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, pages, annotations, counted, exercise_key, answer_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [c.uuid || uuid(), c.name, folderId, c.created_at, c.updated_at || c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.consigne, c.result, c.sources, c.model, c.search_text, c.kind || 'correction', c.pages, c.annotations, c.counted ?? 1, c.exercise_key ?? null, c.answer_hash ?? null]);
       corrMap[c.id] = this.get('SELECT last_insert_rowid() AS id').id;
       stats.corrections++;
     }

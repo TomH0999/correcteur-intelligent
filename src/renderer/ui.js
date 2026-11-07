@@ -117,7 +117,7 @@ export function corrItem(c, { selectable = false, selected = false } = {}) {
       <div class="item-icon"><i class="fa-solid ${practice ? 'fa-dumbbell' : TYPE_ICONS[c.exercise_type] || 'fa-file-lines'}"></i></div>
       <div class="item-main">
         <div class="item-name">${esc(c.name)}</div>
-        <div class="item-meta">${formatDate(c.created_at)} · ${esc(TYPE_LABELS[c.exercise_type] || '—')}${c.folder_name ? ` · <i class="fa-solid fa-folder" style="color:var(--amber)"></i> ${esc(c.folder_name)}` : ''} · ${c.files.length} fichier(s)${practice ? ' · <span class="tag brand">entraînement</span>' : ''}</div>
+        <div class="item-meta">${formatDate(c.created_at)} · ${esc(TYPE_LABELS[c.exercise_type] || '—')}${c.folder_name ? ` · <i class="fa-solid fa-folder" style="color:var(--amber)"></i> ${esc(c.folder_name)}` : ''} · ${c.files.length} fichier(s)${practice ? ' · <span class="tag brand">entraînement</span>' : ''}${c.counted === 0 ? ' · <span class="tag mid">brouillon</span>' : ''}</div>
       </div>
       <div class="item-score" style="color:${scoreColor(c.score)}">${c.grade != null ? `${fr(c.grade)}<span>/${c.grade_max}</span>` : '—'}</div>
     </div>`;

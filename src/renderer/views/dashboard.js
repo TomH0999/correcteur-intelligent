@@ -93,6 +93,36 @@ function bars(items, { valueLabel, color = SERIES[0], onClick } = {}) {
     </div>`).join('');
 }
 
+/** Réussite du premier coup et amélioration entre la 1re et la dernière tentative (corrections enregistrées). */
+function attemptsSection(a) {
+  if (!a || !a.exercises) return '';
+  const pct = (v) => (v == null ? '—' : `${fr(v, 1)} %`);
+  const signed = (v) => (v == null ? '—' : `<span class="delta ${v >= 0 ? 'up' : 'down'}">${v >= 0 ? '+' : ''}${fr(v, 1)} pts</span>`);
+  return `
+    <div class="card" style="margin-top:16px">
+      <h2><i class="fa-solid fa-bullseye"></i>Réussite des exercices</h2>
+      <p class="small muted" style="margin-top:-6px">Calculé uniquement sur les corrections <strong>enregistrées</strong>. Un exercice est réussi à partir de ${a.threshold} % (${a.threshold / 5}/20). Les copies d'un même énoncé sont regroupées en tentatives ; une re-correction de la même copie ne compte pas comme nouvelle tentative.</p>
+      <div class="grid4">
+        ${kpi('fa-bolt', 'Réussite du premier coup', `<span style="color:${scoreColor(a.firstTryRate)}">${pct(a.firstTryRate)}</span>`, `${a.exercises} exercice(s) · 1re tentative : ${pct(a.avgFirstScore)} en moyenne`)}
+        ${kpi('fa-arrow-trend-up', 'Amélioration moyenne', a.avgImprovement == null ? '—' : `${a.avgImprovement >= 0 ? '+' : ''}${fr(a.avgImprovement, 1)} pts`, a.reworked ? `de la 1re à la dernière réponse · ${a.reworked} exercice(s) retravaillé(s)` : 'renvoie une nouvelle réponse à un exercice pour la mesurer')}
+        ${kpi('fa-chart-simple', 'Exercices en progrès', pct(a.improvedRate), 'parmi les exercices retravaillés')}
+        ${kpi('fa-life-ring', 'Rattrapés', pct(a.recoveredRate), `exercices ratés du 1er coup puis réussis · réussite finale ${pct(a.finalRate)}`)}
+      </div>
+      ${a.series.length ? `
+      <table class="cmp-table" style="margin-top:16px">
+        <thead><tr><th>Exercice</th><th>Tentatives</th><th>1re</th><th>Dernière</th><th>Évolution</th><th></th></tr></thead>
+        <tbody>${a.series.slice(0, 15).map((s) => `<tr data-series="${s.attempts[s.attempts.length - 1].id}" style="cursor:pointer">
+          <td>${esc(s.title)}${s.subject ? `<div class="xs dim">${esc(s.subject)}</div>` : ''}</td>
+          <td class="mono">${s.count}</td>
+          <td class="mono" style="color:${scoreColor(s.first)}">${fr(s.first, 1)} %</td>
+          <td class="mono" style="color:${scoreColor(s.last)}">${s.count > 1 ? `${fr(s.last, 1)} %` : '—'}</td>
+          <td>${signed(s.improvement)}</td>
+          <td>${s.firstSuccess ? '<span class="tag ok">1er coup</span>' : s.finalSuccess ? '<span class="tag brand">rattrapé</span>' : '<span class="tag ko">à retravailler</span>'}</td>
+        </tr>`).join('')}</tbody>
+      </table>` : ''}
+    </div>`;
+}
+
 async function render(root) {
   const d = await api.dashboard();
   const scored = d.timeline.filter((t) => t.score != null);
@@ -113,6 +143,7 @@ async function render(root) {
       ${kpi('fa-layer-group', 'Fiches à réviser', d.cards.due || 0, `${d.cards.total || 0} fiche(s) · ${d.cards.mastered || 0} maîtrisée(s)`)}
       ${kpi('fa-dumbbell', 'Exercices faits', `${d.exercises.done || 0}/${d.exercises.total || 0}`, 'exercices d\'entraînement')}
     </div>
+    ${attemptsSection(d.attempts)}
     <div class="card" style="margin-top:16px">
       <h2><i class="fa-solid fa-chart-line"></i>Évolution de tes scores</h2>
       <div id="d-line">${lineChart(d.timeline, d.bySubject.map((s) => s.subject))}</div>
@@ -139,6 +170,7 @@ async function render(root) {
           <td class="small muted">${new Date(s.last).toLocaleDateString('fr-FR')}</td></tr>`).join('')}</tbody>
       </table>
     </div>`;
+  $$('[data-series]', root).forEach((el) => (el.onclick = () => go('result', { id: Number(el.dataset.series) })));
   $$('[data-tip]', root).forEach((el) => {
     el.addEventListener('mousemove', (e) => showTip(e, el.dataset.tip));
     el.addEventListener('mouseleave', hideTip);

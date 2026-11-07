@@ -219,6 +219,7 @@ async function renderExercise(root, { id }) {
         <button class="btn" id="e-attach"><i class="fa-solid fa-paperclip"></i>Joindre des fichiers / photos</button>
         <span class="small muted" id="e-attached"></span>
         <span class="spacer"></span>
+        <label class="check" title="Décoche pour un essai qui ne compte pas dans tes statistiques"><input type="checkbox" id="e-save" checked /><span>Enregistrer</span></label>
         <button class="btn primary" id="e-submit"><i class="fa-solid fa-paper-plane"></i>Faire corriger</button>
       </div>
       <div class="field hidden" id="e-stdin-wrap" style="margin-top:10px"><label class="label">Entrée standard (facultatif)</label><textarea id="e-stdin" rows="2" class="code"></textarea></div>
@@ -272,7 +273,7 @@ async function renderExercise(root, { id }) {
     btn.innerHTML = '<div class="spinner sm"></div>Correction…';
     const off = api.onProgress((p) => { btn.lastChild.textContent = p.message.length > 40 ? p.message.slice(0, 40) + '…' : p.message; });
     try {
-      const { id: cid, warnings } = await api.submitExercise({ id, answer, files: attachments });
+      const { id: cid, warnings } = await api.submitExercise({ id, answer, files: attachments, counted: $('#e-save', root).checked });
       warnings?.forEach((w) => toast(w, 'warn', 8000));
       refreshStats();
       go('result', { id: cid });

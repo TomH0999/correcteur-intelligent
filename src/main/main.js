@@ -116,7 +116,7 @@ async function buildContext({ needVision = false, needAudio = false, progress = 
 
 const hasType = (files, t) => files.some((f) => f.parts.some((p) => p.type === t));
 
-async function saveAndCards(out, { files, consigne, kind = 'correction', exerciseId = null, folderId = null, nameSuffix = '', previews = [], pagesList = null }) {
+async function saveAndCards(out, { files, consigne, kind = 'correction', exerciseId = null, exerciseUuid = null, folderId = null, nameSuffix = '', previews = [], pagesList = null, counted = true, exerciseKey = null }) {
   const now = new Date();
   const uuid = crypto.randomUUID();
   // Aperçus des pages de la copie (pour l'affichage annoté), enregistrés sur le disque
@@ -131,6 +131,9 @@ async function saveAndCards(out, { files, consigne, kind = 'correction', exercis
   }
   const id = db.saveCorrection({
     uuid,
+    counted,
+    exerciseUuid,
+    exerciseKey,
     pages: savedPages,
     name: buildName(out.result, now) + nameSuffix,
     createdAt: now.toISOString(),
@@ -147,8 +150,9 @@ async function saveAndCards(out, { files, consigne, kind = 'correction', exercis
 }
 
 /** Fiches de révision générées en arrière-plan après une correction. */
-function autoFlashcards(ctx, id, result) {
-  if (!settings.prefs.autoFlashcards || (!result.fautes.length && !result.a_revoir.length)) return;
+function autoFlashcards(ctx, id, result, counted = true) {
+  // Pas de fiches pour un brouillon
+  if (!counted || !settings.prefs.autoFlashcards || (!result.fautes.length && !result.a_revoir.length)) return;
   generateFlashcards({ ...ctx, progress: () => {}, notes: [] }, result)
     .then((cards) => {
       if (!cards.length) return;
@@ -159,12 +163,12 @@ function autoFlashcards(ctx, id, result) {
 }
 
 /** Une correction complète (utilisée par le bouton « Corriger » et par la file d'attente). */
-async function runCorrectionTask({ files, consigne = '', previews = [], folderId = null }, { progress, signal }) {
+async function runCorrectionTask({ files, consigne = '', previews = [], folderId = null, counted = true }, { progress, signal }) {
   const ctx = await buildContext({ needVision: hasType(files, 'image'), needAudio: hasType(files, 'audio'), progress, signal });
   const out = await correct(ctx, { files, consigne, runCode: runner.runCode });
   progress({ step: 'save', message: 'Enregistrement dans l\'historique…' });
-  const id = await saveAndCards(out, { files: files.map((f) => ({ name: f.name, role: f.role || 'auto' })), consigne, previews, folderId });
-  autoFlashcards(ctx, id, out.result);
+  const id = await saveAndCards(out, { files: files.map((f) => ({ name: f.name, role: f.role || 'auto' })), consigne, previews, folderId: counted ? folderId : null, counted });
+  autoFlashcards(ctx, id, out.result, counted);
   return { id, warnings: out.warnings };
 }
 
@@ -202,10 +206,10 @@ function registerIpc() {
   // ---- Correction ----
   const progress = (data) => send('correct:progress', data);
 
-  handle('correct:run', async ({ files, consigne, previews }) => {
+  handle('correct:run', async ({ files, consigne, previews, counted = true }) => {
     currentAbort = new AbortController();
     try {
-      return await runCorrectionTask({ files, consigne, previews }, { progress, signal: currentAbort.signal });
+      return await runCorrectionTask({ files, consigne, previews, counted }, { progress, signal: currentAbort.signal });
     } finally {
       currentAbort = null;
     }
@@ -274,7 +278,7 @@ function registerIpc() {
     try {
       const ctx = await buildContext({ progress, signal: currentAbort.signal });
       const out = await recorrect(ctx, { sources: rec.sources, consigne: rec.consigne, runCode: runner.runCode });
-      const newId = await saveAndCards(out, { files: rec.files, consigne: rec.consigne, folderId: rec.folder_id, kind: rec.kind, exerciseId: rec.exercise_id, nameSuffix: ' (re-correction)', pagesList: rec.pages });
+      const newId = await saveAndCards(out, { files: rec.files, consigne: rec.consigne, folderId: rec.folder_id, kind: rec.kind, exerciseId: rec.exercise_id, nameSuffix: ' (re-correction)', pagesList: rec.pages, counted: !!rec.counted, exerciseKey: rec.exercise_key });
       return { id: newId, warnings: out.warnings };
     } finally {
       currentAbort = null;
@@ -317,6 +321,8 @@ function registerIpc() {
     if (dir && !db.get('SELECT id FROM corrections WHERE pages LIKE ?', [`%pages/${dir}/%`])) pages.deletePages(dataDir, dir);
   });
   handle('db:stats', () => db.stats());
+  handle('db:attempts', (id) => db.attemptsFor(id));
+  handle('db:seriesChoices', (id) => db.seriesChoices(id));
   handle('db:dashboard', () => db.dashboard());
 
   // ---- Fiches de révision ----
@@ -344,7 +350,7 @@ function registerIpc() {
   handle('ex:get', (id) => db.getExercise(id));
   handle('ex:update', (id, patch) => db.updateExercise(id, patch));
   handle('ex:delete', (id) => db.deleteExercise(id));
-  handle('ex:submit', async ({ id, answer, files = [], previews = [] }) => {
+  handle('ex:submit', async ({ id, answer, files = [], previews = [], counted = true }) => {
     const ex = db.getExercise(id);
     if (!ex) throw new Error('Exercice introuvable.');
     const all = [
@@ -356,9 +362,9 @@ function registerIpc() {
     try {
       const ctx = await buildContext({ needVision: hasType(all, 'image'), needAudio: hasType(all, 'audio'), progress, signal: currentAbort.signal });
       const out = await correct(ctx, { files: all, consigne: 'Exercice d\'entraînement généré par l\'application.', runCode: runner.runCode });
-      const cid = await saveAndCards(out, { files: all.map((f) => ({ name: f.name, role: f.role })), consigne: '', kind: 'practice', exerciseId: id, nameSuffix: ' (entraînement)', previews });
-      db.updateExercise(id, { doneCorrectionId: cid, draft: answer || '' });
-      autoFlashcards(ctx, cid, out.result);
+      const cid = await saveAndCards(out, { files: all.map((f) => ({ name: f.name, role: f.role })), consigne: '', kind: 'practice', exerciseId: id, exerciseUuid: ex.uuid, nameSuffix: ' (entraînement)', previews, counted });
+      db.updateExercise(id, counted ? { doneCorrectionId: cid, draft: answer || '' } : { draft: answer || '' });
+      autoFlashcards(ctx, cid, out.result, counted);
       return { id: cid, warnings: out.warnings };
     } finally {
       currentAbort = null;
@@ -500,6 +506,10 @@ if (!gotLock) {
     const today = new Date().toISOString().slice(0, 10);
     if (settings.get('lastAutoBackup') !== today && db.stats().total) {
       backup.autoBackup(db, settings, app.getVersion(), dataDir, 'quotidienne').then(() => settings.set('lastAutoBackup', today)).catch((err) => console.warn('Sauvegarde auto :', err.message));
+    }
+    // Brouillons de plus de 14 jours supprimés
+    for (const dir of db.purgeDrafts(14)) {
+      if (!db.get('SELECT id FROM corrections WHERE pages LIKE ?', [`%pages/${dir}/%`])) pages.deletePages(dataDir, dir);
     }
     // File d'attente : reprise des corrections interrompues
     queue = new Queue({
