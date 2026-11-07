@@ -1,0 +1,58 @@
+name: Build Windows (.exe)
+
+on:
+  push:
+    branches: [main, master, 'claude/**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      - name: Tests
+        run: npm test
+
+      - name: Construire l'installateur Windows
+        run: npx electron-builder --win nsis --x64 --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Lire la version
+        id: v
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Publier l'artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Correcteur-Intelligent-Setup-${{ steps.v.outputs.version }}
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Créer / mettre à jour la release GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.v.outputs.version }}
+          name: Correcteur Intelligent v${{ steps.v.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: dist/*.exe
+          body: |
+            ## Installation (Windows 10/11)
+            1. Télécharge **Correcteur-Intelligent-Setup-${{ steps.v.outputs.version }}.exe** ci-dessous.
+            2. Lance-le. Si Windows SmartScreen affiche « Windows a protégé votre ordinateur », clique sur **Informations complémentaires → Exécuter quand même** (l'application n'est pas signée).
+            3. Au premier lancement, va dans **Paramètres** et colle ta clé API Groq (gratuite : https://console.groq.com/keys).
