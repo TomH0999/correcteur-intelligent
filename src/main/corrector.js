@@ -23,6 +23,16 @@ const DEFAULTS = {
   autoFlashcards: true
 };
 
+/** Règles d'équité : ce qui ne doit JAMAIS coûter de points à l'étudiant (erreurs internes, pas les siennes). */
+const FAIRNESS_RULES = `RÈGLES D'ÉQUITÉ (à respecter impérativement)
+- Une syntaxe VALIDE dans un SGBD ou une version de langage courants n'est PAS une faute : Oracle (MINUS, NVL, NVL2, DECODE, SYSDATE, DUAL, ROWNUM, VARCHAR2, NUMBER, TO_DATE, séquences .NEXTVAL, jointure (+), PL/SQL, commandes SQL*Plus comme SET SERVEROUTPUT ON, PROMPT, « / »), MySQL (AUTO_INCREMENT, backticks, LIMIT a,b, IFNULL), PostgreSQL, SQL Server (TOP, GETDATE), Python 3, Java, C, JavaScript… Ne la sanctionne que si l'énoncé impose explicitement un autre dialecte.
+- Les résultats d'exécution marqués « LIMITE DE L'OUTIL » ne disent RIEN sur la justesse du code : ignore-les et évalue le code par ton propre raisonnement. Ne crée jamais de faute à partir d'eux et ne mentionne pas l'outil (SQLite, PostgreSQL, Pyodide…) comme cause d'une faute.
+- Un échec d'exécution peut venir du programme de test généré automatiquement (données de test incomplètes, sortie attendue erronée, entrée non fournie) : vérifie que l'erreur vient bien du code de l'étudiant avant de la compter.
+- Ne sanctionne pas l'ordre des lignes d'un résultat SQL sans ORDER BY, les différences d'espaces, de casse des mots-clés, de format d'affichage des nombres ou des dates, sauf si l'énoncé l'exige.
+- Les passages marqués « [… tronqué …] » n'ont pas été transmis : ne pénalise pas ce qui pourrait s'y trouver.
+- Le texte provenant d'une image (photo, scan, manuscrit) est une transcription automatique qui peut contenir des erreurs (caractère mal lu, indentation perdue, symbole manquant) : ne compte pas comme faute ce qui ressemble à une erreur de lecture ; signale-le dans les remarques.
+- Dans le doute sur l'origine d'une erreur (étudiant ou outil), ne retire pas de points et signale-le dans le commentaire.`;
+
 const EXERCISE_TYPES = ['maths', 'developpement', 'base_de_donnees', 'reseau', 'systeme', 'algorithmique', 'web', 'genie_logiciel', 'architecture', 'anglais', 'communication', 'gestion', 'autre'];
 
 const VISION_PROMPT = `Tu es un expert en transcription de documents scolaires d'informatique (BUT Informatique).
@@ -49,6 +59,8 @@ On te fournit un ou plusieurs documents (déjà convertis en texte ; les images 
 3. Si des RÉSULTATS D'EXÉCUTION RÉELLE du code sont fournis, appuie-toi dessus en priorité (ce sont des faits) et cite-les dans tes commentaires. Attention : un échec peut venir du programme de test et non de l'étudiant ; juge avec discernement.
 4. NOTE de façon juste sur ${s.gradeMax}. Si un barème ou un corrigé du professeur est fourni, APPLIQUE-LE STRICTEMENT (mêmes points par question, mêmes attendus) puis ramène la note sur ${s.gradeMax}. Sinon respecte le barème de l'énoncé s'il existe, ou répartis les points de manière cohérente. Sévérité demandée : ${s.severity}. Une erreur de transcription évidente (OCR) ne doit pas être sanctionnée ; signale-la plutôt.
 5. Rédige un RAPPORT DE FAUTES précis, des AMÉLIORATIONS possibles et une liste de NOTIONS À REVOIR, puis une CORRECTION MODÈLE complète.
+
+${FAIRNESS_RULES}
 
 RÈGLES DE FORME
 - Tout en français, ton pédagogique, direct, concret. Tutoie l'étudiant.
@@ -107,9 +119,19 @@ const num = (v, d = 0) => {
 const arr = (v) => (Array.isArray(v) ? v : v ? [v] : []);
 const str = (v) => (v == null ? '' : typeof v === 'string' ? v : JSON.stringify(v));
 
+/** Une « faute » qui accuse en réalité l'outil d'exécution (moteur SQL, environnement…) n'est pas une faute de l'étudiant. */
+const TOOL_BLAME = /\b(sqlite|postgre(s|sql)|pglite|pyodide|l'outil (d'exécution|de test)|environnement (d'exécution|de test)|moteur (sql|d'exécution)|non (reconnu|supporté|pris en charge) par (le moteur|l'outil|sqlite|postgre)|limite de l'outil)\b/i;
+
 /** Valide et complète le JSON renvoyé par le modèle. */
 function normalizeResult(raw, gradeMax = 20) {
   const r = raw && typeof raw === 'object' ? raw : {};
+  if (Array.isArray(r.fautes)) {
+    const before = r.fautes.length;
+    r.fautes = r.fautes.filter((f) => !TOOL_BLAME.test(`${f?.description || ''} ${f?.correction || ''}`));
+    if (r.fautes.length < before && r.identification && typeof r.identification === 'object') {
+      r.identification.remarques = `${r.identification.remarques || ''} (${before - r.fautes.length} remarque(s) liée(s) à l'outil d'exécution retirée(s) : ce ne sont pas des erreurs de l'étudiant.)`.trim();
+    }
+  }
   const questions = arr(r.questions).map((q) => ({
     numero: str(q.numero),
     intitule: str(q.intitule),
@@ -235,8 +257,8 @@ DOCUMENT ${i + 1}>>>`;
 
 function executionsBlock(executions) {
   if (!executions?.length) return '';
-  return `\n\nRÉSULTATS D'EXÉCUTION RÉELLE (le code de l'étudiant a été exécuté par l'application avec des tests) :\n${executions.map((e, i) => `--- Test ${i + 1} (${e.langage}) : ${e.but}
-Sortie attendue : ${e.sortie_attendue || '(non précisée)'}
+  return `\n\nRÉSULTATS D'EXÉCUTION RÉELLE (le code de l'étudiant a été exécuté par l'application avec des tests générés automatiquement) :\n${executions.map((e, i) => `--- Test ${i + 1} (${e.langage}) : ${e.but}
+${e.internal ? `⚠ LIMITE DE L'OUTIL — PAS UNE ERREUR DE L'ÉTUDIANT : ${e.explication || e.category}. Ignore ce résultat pour la note et évalue ce code par raisonnement.\n` : ''}${e.fromImage ? 'ℹ Code transcrit depuis une image : une erreur de syntaxe peut venir de la transcription.\n' : ''}Sortie attendue : ${e.sortie_attendue || '(non précisée)'}
 ${e.unavailable ? `Non exécuté : ${e.stderr}` : `Code de retour : ${e.exitCode}${e.timedOut ? ' (TEMPS DÉPASSÉ)' : ''}
 Sortie obtenue :
 ${(e.stdout || '').slice(0, 3000) || '(vide)'}${e.stderr ? `\nErreurs :\n${e.stderr.slice(0, 2000)}` : ''}`}`).join('\n\n')}`;
@@ -413,23 +435,33 @@ function hasRunnableCode(sources) {
 }
 
 const TESTS_SYSTEM = `Tu prépares des tests d'exécution pour vérifier le code écrit par un étudiant en informatique.
-Langages exécutables : python, javascript, sql (SQLite), java (fichier unique avec main), c, cpp, php.
-Pour chaque réponse de code de l'ÉTUDIANT (pas l'énoncé), écris un programme COMPLET et AUTONOME qui reprend son code TEL QUEL (sans corriger ses erreurs) et ajoute des appels de test qui AFFICHENT les résultats (cas normaux et cas limites demandés par l'énoncé).
-Pour le SQL : crée d'abord les tables et insère un petit jeu de données cohérent avec l'énoncé (en SQLite), puis exécute les requêtes de l'étudiant telles quelles. Adapte uniquement la syntaxe spécifique à un SGBD (ex. Oracle) si c'est indispensable pour SQLite.
+Langages exécutables : python (3.14, bibliothèque standard, numpy/pandas si besoin), javascript et typescript (Node.js), sql, java (un fichier, plusieurs classes possibles), c, cpp, php.
+Pour chaque réponse de code de l'ÉTUDIANT (pas l'énoncé), écris un programme COMPLET et AUTONOME qui reprend son code TEL QUEL — sans corriger ses erreurs NI changer sa syntaxe — et ajoute des appels de test qui AFFICHENT les résultats (cas normaux et cas limites demandés par l'énoncé).
+SQL : écris le script dans le dialecte de l'étudiant (Oracle, MySQL, PostgreSQL, SQL Server… l'application convertit automatiquement : ne modifie JAMAIS sa syntaxe). Commence par créer les tables et insérer un jeu de données cohérent avec l'énoncé, assez riche pour distinguer une requête juste d'une fausse (cas avec NULL, doublons, lignes qui ne doivent pas sortir), puis ses requêtes telles quelles.
+Si le programme lit au clavier (input, Scanner, scanf, cin, readline…), fournis TOUTES les valeurs nécessaires dans "entree" (une par ligne). S'il lit des fichiers, fournis-les dans "fichiers" ({"nom.txt": "contenu"}).
+Si la réponse est un fragment (une fonction seule), ajoute le code d'appel nécessaire autour, sans toucher au fragment.
 Indique la sortie attendue si le code était correct. Au maximum 4 tests, les plus révélateurs. Si rien n'est exécutable, renvoie une liste vide.
-Réponds UNIQUEMENT en JSON : {"executions":[{"but":"ce que le test vérifie","langage":"python|javascript|sql|java|c|cpp|php","code":"programme complet","entree":"texte envoyé sur l'entrée standard (souvent vide)","sortie_attendue":"…"}]}`;
+Réponds UNIQUEMENT en JSON : {"executions":[{"but":"ce que le test vérifie","langage":"python|javascript|typescript|sql|java|c|cpp|php","code":"programme complet","entree":"texte envoyé sur l'entrée standard","fichiers":{},"sortie_attendue":"…"}]}`;
 
 /** Demande à l'IA un plan de tests pour un bloc de documents, puis exécute réellement le code de l'étudiant. */
 async function verifyByExecution(ctx, docsText, consigne, runCode, { sizeSensitive = false } = {}) {
   if (!ctx.s.executeCode || !runCode || !hasRunnableCode([{ text: docsText }])) return [];
+  // Code lu sur une image : une faute de syntaxe peut venir de la transcription
+  const fromImage = /nature: transcription automatique d'image/.test(docsText) && !/nature: (texte extrait|page de PDF)[\s\S]*?(```|def |class |SELECT)/.test(docsText);
   try {
     const { parsed } = await chatWithFallback(ctx, { system: TESTS_SYSTEM, user: `${consigne ? `Indications : ${consigne}\n\n` : ''}${docsText}`, wantOut: 3500, step: 'tests', label: 'Préparation des tests', sizeSensitive, effort: 'low' });
     const plan = arr(parsed.executions).filter((e) => e && e.code).slice(0, 4);
     const out = [];
     for (const [i, e] of plan.entries()) {
       ctx.progress({ step: 'tests', message: `Exécution du test ${i + 1}/${plan.length} (${e.langage})…` });
-      const r = await runCode({ language: e.langage, code: str(e.code), stdin: str(e.entree), timeoutMs: 10000 });
-      out.push({ but: str(e.but), langage: r.language, code: str(e.code), entree: str(e.entree), sortie_attendue: str(e.sortie_attendue), stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode, timedOut: !!r.timedOut, unavailable: !!r.unavailable, ok: r.ok, durationMs: r.durationMs });
+      const files = e.fichiers && typeof e.fichiers === 'object' && !Array.isArray(e.fichiers) ? Object.fromEntries(Object.entries(e.fichiers).map(([k, v]) => [String(k).replace(/[\\/]+/g, '_'), str(v)])) : {};
+      const r = await runCode({ language: e.langage, code: str(e.code), stdin: str(e.entree), timeoutMs: 10000, files });
+      out.push({
+        but: str(e.but), langage: r.language, code: str(e.code), entree: str(e.entree), sortie_attendue: str(e.sortie_attendue),
+        stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode, timedOut: !!r.timedOut, unavailable: !!r.unavailable, ok: r.ok, durationMs: r.durationMs,
+        // Erreur due à l'outil (dialecte, entrée non fournie, module absent…) : jamais comptée
+        internal: !!r.internal, category: r.category || null, explication: r.explication || null, fromImage
+      });
     }
     return out;
   } catch (err) {
@@ -476,7 +508,10 @@ function buildPartialPrompt(s) {
   return `Tu es un correcteur expert et bienveillant pour des étudiants en ${s.level} (France), spécialiste de tout le programme du BUT Informatique.
 Tu corriges UNE PARTIE d'un devoir : uniquement les questions fournies ci-dessous (le reste est corrigé séparément).
 Pour chaque question : vérifie l'exactitude (calculs refaits, code exécuté mentalement, requêtes SQL, schémas), la méthode et la rédaction. Appuie-toi en priorité sur les RÉSULTATS D'EXÉCUTION RÉELLE s'ils sont fournis.
-Attribue des points : applique STRICTEMENT le barème du professeur s'il est fourni, sinon celui de l'énoncé, sinon un barème cohérent. Sévérité : ${s.severity}. Ne sanctionne pas une erreur évidente de transcription (OCR).
+Attribue des points : applique STRICTEMENT le barème du professeur s'il est fourni, sinon celui de l'énoncé, sinon un barème cohérent. Sévérité : ${s.severity}.
+${FAIRNESS_RULES}
+- Le contexte commun de l'énoncé a pu être résumé : ne pénalise pas l'absence d'un élément qui n'est pas fourni ici.
+- Si la réponse à une question est notée « aucune réponse trouvée », vérifie d'abord dans les « RÉPONSES SANS NUMÉRO » fournies avant de conclure qu'elle n'est pas traitée.
 Tout en français, tutoiement, Markdown, maths en LaTeX $…$, code dans des blocs \`\`\`.
 Réponds UNIQUEMENT en JSON :
 {"questions":[{"numero":"1.a","intitule":"…","statut":"correct | partiel | incorrect | non_traite","points_obtenus":0,"points_max":0,"commentaire":"…"}],
@@ -566,6 +601,8 @@ async function indexDocuments(ctx, sources) {
       for (const g of segs) {
         let nature = ['enonce', 'reponse', 'bareme', 'autre'].includes(g.nature) ? g.nature : 'reponse';
         if (src.role && src.role !== 'auto' && nature !== 'autre') nature = src.role;
+        // Un long passage classé « autre » dans une copie est gardé comme réponse (évite de perdre du travail)
+        if (nature === 'autre' && (g.a - g.de >= 3) && src.role !== 'enonce') nature = 'reponse';
         if (nature === 'autre') continue;
         const text = lines.slice(g.de - 1, g.a).join('\n').trim();
         if (!text) continue;
@@ -628,7 +665,10 @@ async function correctChunked(ctx, sources, consigne, runCode) {
   // Contexte commun (présentation, données…) : au plus 30 % du budget de chaque lot
   const sharedRaw = [...general.enonce, ...general.bareme.map((t) => `[BARÈME / CORRIGÉ]\n${t}`)].join('\n\n');
   const shared = sharedRaw ? await condense(ctx, sharedRaw, Math.floor(b.input * 0.3)) : '';
-  if (general.reponse.length) units.push({ key: 'general', label: 'Réponses sans numéro', enonce: [], bareme: [], reponse: general.reponse });
+  // Réponses sans numéro : jointes aux questions dont la réponse n'a pas été repérée (au lieu de les compter « non traitées »)
+  const looseAnswers = general.reponse.length ? sliceText(general.reponse.join('\n\n'), Math.floor(b.input * 0.25)) : '';
+  if (looseAnswers) for (const u of units) if (!u.reponse.length) u.reponse.push(`[Réponse non numérotée — à chercher parmi les RÉPONSES SANS NUMÉRO ci-dessous]\n${looseAnswers}`);
+  if (general.reponse.length && units.every((u) => u.reponse.length && !u.reponse[0].startsWith('[Réponse non numérotée'))) units.push({ key: 'general', label: 'Réponses sans numéro', enonce: [], bareme: [], reponse: general.reponse });
   if (!units.length) throw new Error('Aucune question ni réponse n\'a pu être repérée dans les documents.');
   const head = `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}${shared ? `CONTEXTE COMMUN DE L'ÉNONCÉ :\n${shared}\n\n` : ''}QUESTIONS À CORRIGER DANS CE LOT :\n\n`;
   const room = Math.max(600, b.input - est(head) - 400);
@@ -725,7 +765,7 @@ NOTIONS À REVOIR : ${merged.a_revoir.map((a) => `${str(a.notion || a)} (${str(a
     appreciation: synth.appreciation,
     resume: synth.resume,
     points_forts: arr(synth.points_forts).length ? synth.points_forts : merged.points_forts.slice(0, 6),
-    questions: merged.questions,
+    questions: dedupeQuestions(merged.questions),
     fautes: merged.fautes,
     ameliorations: arr(synth.ameliorations).length ? synth.ameliorations : merged.ameliorations.slice(0, 8),
     a_revoir: arr(synth.a_revoir).length ? synth.a_revoir : merged.a_revoir.slice(0, 10),
@@ -736,6 +776,19 @@ NOTIONS À REVOIR : ${merged.a_revoir.map((a) => `${str(a.notion || a)} (${str(a
   result.executions = merged.executions;
   ctx.notes.push(`Documents volumineux : correction réalisée en ${batches.length} lot(s) successifs pour respecter les limites de ${ctx.models.main}.`);
   return { result, model, mode: 'chunked' };
+}
+
+/** Une même question corrigée dans deux lots (copie en plusieurs fichiers) ne doit compter qu'une fois. */
+function dedupeQuestions(questions) {
+  const rank = { correct: 3, partiel: 2, incorrect: 1, non_traite: 0 };
+  const byKey = new Map();
+  for (const q of arr(questions)) {
+    const key = normQ(q.numero) || `#${byKey.size}`;
+    const prev = byKey.get(key);
+    // On garde la version où la réponse a été trouvée (pas « non traitée ») et la mieux notée
+    if (!prev || (rank[q.statut] ?? 1) > (rank[prev.statut] ?? 1) || ((rank[q.statut] ?? 1) === (rank[prev.statut] ?? 1) && num(q.points_obtenus) > num(prev.points_obtenus))) byKey.set(key, q);
+  }
+  return [...byKey.values()];
 }
 
 /** Choisit automatiquement : un seul appel si tout tient dans les limites du modèle, sinon correction découpée. */

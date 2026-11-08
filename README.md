@@ -37,6 +37,7 @@ dans n'importe quel format — et l'application :
 | 📋 **File d'attente / lots** | Corrige plusieurs copies à la suite en arrière-plan (une copie par fichier avec le même énoncé) ; reprise automatique après fermeture, notification à la fin. |
 | 🖍️ **Copie annotée** | Les fautes sont surlignées directement sur ta copie : par le texte pour les PDF, par l'IA de vision pour les photos/scans, dans le texte pour le code. |
 | 🧩 **Gros devoirs** | Si les documents dépassent les limites du modèle (sortie max, jetons par minute de l'offre gratuite), la correction est automatiquement découpée : lecture document par document, correction par lots de questions, synthèse finale. |
+| ⚖️ **Pas de fausses erreurs** | Le code est exécuté sur de vrais moteurs : **PostgreSQL embarqué** avec conversion automatique d'Oracle (MINUS, NVL, DECODE, DUAL, ROWNUM, séquences, PL/SQL, scripts SQL*Plus…), MySQL et SQL Server ; vrai Node.js pour JavaScript/TypeScript ; Python avec bibliothèques. Les erreurs dues à l'outil (dialecte non convertible, saisie clavier non fournie, module absent…) sont signalées « limite de l'outil » et ne coûtent jamais de points. |
 | 📝 **Brouillons** | Case « Enregistrer » : décochée, la correction s'affiche mais ne compte ni dans l'historique, ni dans les statistiques, ni dans les fiches (supprimée après 14 jours, enregistrable après coup). |
 | 🎯 **Réussite & amélioration** | Les copies d'un même énoncé sont regroupées en tentatives : taux de réussite du premier coup, amélioration de la 1re à la dernière réponse, exercices rattrapés (corrections enregistrées uniquement). |
 | 🛟 **Données protégées** | Conservées lors des mises à jour, sauvegarde automatique quotidienne et avant chaque mise à jour / réinitialisation, bouton de réinitialisation avec confirmation. |
@@ -74,7 +75,7 @@ npm run dist:win   # construit l'installateur .exe (sous Windows)
 ```
 
 À chaque push, **GitHub Actions** (`.github/workflows/build-windows.yml`) lance les tests, construit l'installateur,
-lui attribue la version `1.3.<numéro de build>` et publie une Release avec `latest.yml` : c'est ce fichier que les
+lui attribue la version `1.4.<numéro de build>` et publie une Release avec `latest.yml` : c'est ce fichier que les
 applications installées consultent pour se mettre à jour.
 
 **Signature de code (facultatif)** : ajoute les secrets `WIN_CSC_LINK` (certificat `.pfx` en base64) et
@@ -90,7 +91,9 @@ src/main/          processus principal Electron
   limits.js        limites des modèles (contexte, sortie max, jetons/minute) apprises en direct + régulateur de débit
   queue.js         file d'attente persistante (reprise après redémarrage)
   pages.js         aperçus des pages de copie pour l'affichage annoté
-  runner.js        exécution de code (worker Python/JS/SQL + compilateurs locaux)
+  runner.js        exécution de code (worker Python/SQL, Node.js pour JS/TS, compilateurs locaux)
+  sqlcompat.js     conversion Oracle / MySQL / SQL Server -> PostgreSQL (PGlite), scripts SQL*Plus, PL/SQL
+  execclass.js     distingue les erreurs de l'outil des vraies erreurs de l'étudiant
   ocr.js           OCR local Tesseract (secours hors ligne)
   db.js            SQLite (sql.js) : dossiers, corrections, fiches, exercices, tableau de bord, fusion
   backup.js        sauvegarde, restauration, synchronisation par dossier cloud

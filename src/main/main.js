@@ -490,6 +490,7 @@ if (!gotLock) {
   if (process.platform === 'win32') app.setAppUserModelId('fr.tomh0999.correcteur-intelligent');
   app.whenReady().then(async () => {
     dataDir = app.getPath('userData');
+    runner.setDataDir(dataDir);
     settings = new Settings(path.join(dataDir, 'settings.json'), safeStorage);
     resolver = new ModelResolver(settings.modelStore());
     book = new LimitBook(settings.limitStore());

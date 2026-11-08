@@ -183,11 +183,12 @@ async function renderTraining(root, params = {}) {
 register('training', { title: 'Exercices d\'entraînement', show: (root, params) => renderTraining(root, params) });
 
 // ---------- Faire un exercice ----------
-const RUN_LANGS = [['python', 'Python'], ['javascript', 'JavaScript'], ['sql', 'SQL (SQLite)'], ['java', 'Java'], ['c', 'C'], ['cpp', 'C++'], ['php', 'PHP']];
+const RUN_LANGS = [['python', 'Python'], ['javascript', 'JavaScript'], ['typescript', 'TypeScript'], ['sql', 'SQL (Oracle, MySQL, PostgreSQL…)'], ['java', 'Java'], ['c', 'C'], ['cpp', 'C++'], ['php', 'PHP']];
 
 function guessLang(ex) {
   const l = `${ex.language || ''} ${ex.exercise_type || ''}`.toLowerCase();
   if (/sql|base_de_donnees/.test(l)) return 'sql';
+  if (/typescript|\bts\b/.test(l)) return 'typescript';
   if (/java(?!script)/.test(l)) return 'java';
   if (/javascript|js|web/.test(l)) return 'javascript';
   if (/c\+\+|cpp/.test(l)) return 'cpp';

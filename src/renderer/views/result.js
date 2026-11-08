@@ -10,7 +10,7 @@ function ring(score) {
   return `<svg viewBox="0 0 150 150" class="ring"><circle cx="75" cy="75" r="${r}" class="ring-bg"/><circle cx="75" cy="75" r="${r}" class="ring-fg" style="stroke:${scoreColor(score)};stroke-dasharray:${c};stroke-dashoffset:${off}"/></svg>`;
 }
 
-const execTone = (e) => (e.unavailable ? 'na' : e.ok ? 'ok' : 'ko');
+const execTone = (e) => (e.internal && !e.ok ? 'na' : e.unavailable ? 'na' : e.ok ? 'ok' : 'ko');
 
 function render(root, rec) {
   const r = rec.result;
@@ -55,7 +55,7 @@ function render(root, rec) {
           <span class="badge ko">${n('incorrect')} incorrect</span>
           <span class="badge none">${n('non_traite')} non traité</span>
           <span class="badge">${r.fautes.length} faute(s)</span>
-          ${ex.length ? `<span class="badge ${ex.every((e) => e.ok || e.unavailable) ? 'ok' : 'ko'}"><i class="fa-solid fa-terminal"></i>${ex.filter((e) => e.ok).length}/${ex.length} test(s) réussi(s)</span>` : ''}
+          ${ex.length ? (() => { const counted = ex.filter((e) => !(e.internal && !e.ok) && !e.unavailable); return `<span class="badge ${counted.every((e) => e.ok) ? 'ok' : 'ko'}"><i class="fa-solid fa-terminal"></i>${counted.filter((e) => e.ok).length}/${counted.length} test(s) réussi(s)${counted.length < ex.length ? ` · ${ex.length - counted.length} non compté(s)` : ''}</span>`; })() : ''}
         </div>
       </div>
     </div>
@@ -117,10 +117,11 @@ function render(root, rec) {
       ${ex.map((e, i) => `
         <div class="faute exec ${execTone(e)}">
           <div class="faute-head">
-            <span class="tag ${e.unavailable ? 'brand' : e.ok ? 'ok' : 'ko'}">${e.unavailable ? 'non exécuté' : e.timedOut ? 'temps dépassé' : e.ok ? 'exécuté' : 'erreur'}</span>
+            <span class="tag ${e.unavailable || (e.internal && !e.ok) ? 'brand' : e.ok ? 'ok' : 'ko'}">${e.unavailable ? 'non exécuté' : e.internal && !e.ok ? 'limite de l\'outil — non compté' : e.timedOut ? 'temps dépassé' : e.ok ? 'exécuté' : 'erreur'}</span>
             <strong>${esc(e.but)}</strong><span class="badge">${esc(e.langage)}</span>
             ${e.durationMs ? `<span class="xs dim">${e.durationMs} ms</span>` : ''}
           </div>
+          ${e.internal ? `<div class="small" style="color:var(--brand400);margin:4px 0"><i class="fa-solid fa-circle-info"></i> ${esc(e.explication || 'Limite de l\'outil d\'exécution : ce n\'est pas une erreur de ta part.')}</div>` : ''}
           <details class="src"><summary>Programme de test</summary><pre>${esc(e.code)}</pre>${e.entree ? `<div class="lbl">Entrée</div><pre>${esc(e.entree)}</pre>` : ''}</details>
           <div class="grid2">
             <div><div class="lbl">Sortie attendue</div><pre>${esc(e.sortie_attendue || '—')}</pre></div>
