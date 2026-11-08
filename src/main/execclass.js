@@ -8,8 +8,8 @@
 const READS_INPUT = {
   python: /\binput\s*\(|sys\.stdin/,
   java: /\bScanner\b|BufferedReader|System\.in\b|Console\b/,
-  c: /\bscanf\s*\(|\bgetchar\s*\(|\bfgets\s*\(|\bgets\s*\(/,
-  cpp: /\bcin\b|\bscanf\s*\(|\bgetline\s*\(/,
+  c: /\bscanf\s*\(|\bgetchar\s*\(|\bfgets\s*\(|\bgets\s*\(|\b_?getch?e?\s*\(|\bkbhit\s*\(|system\s*\(\s*"pause"/,
+  cpp: /\bcin\b|\bscanf\s*\(|\bgetline\s*\(|\b_?getch?e?\s*\(|\bkbhit\s*\(|system\s*\(\s*"pause"/,
   javascript: /\bprompt\s*\(|readline|process\.stdin/,
   typescript: /\bprompt\s*\(|readline|process\.stdin/,
   php: /\bfgets\s*\(\s*STDIN|readline\s*\(|fscanf\s*\(\s*STDIN/

@@ -186,7 +186,12 @@ async function runNative(language, code, stdin, timeoutMs, files) {
       const src = path.join(dir, language === 'c' ? 'main.c' : 'main.cpp');
       const exe = path.join(dir, process.platform === 'win32' ? 'main.exe' : 'main');
       fs.writeFileSync(src, code);
-      const comp = await runProcess(cc, [src, '-o', exe, '-lm', ...(language === 'cpp' ? ['-std=c++17'] : [])], { cwd: dir, timeoutMs: 30000 });
+      const kbd = ['-Dgetch=getchar', '-D_getch=getchar', '-Dgetche=getchar', '-D_getche=getchar'];
+      const std = language === 'cpp' ? ['-std=c++17'] : [];
+      const usesKbd = /\b_?getche?\s*\(/.test(code);
+      let comp = await runProcess(cc, [src, '-o', exe, '-lm', ...(usesKbd ? kbd : []), ...std], { cwd: dir, timeoutMs: 30000 });
+      // Redirection de getch() refusée par ce compilateur : compilation normale
+      if (!comp.ok && usesKbd) comp = await runProcess(cc, [src, '-o', exe, '-lm', ...std], { cwd: dir, timeoutMs: 30000 });
       if (!comp.ok) return { ...comp, stderr: `Erreur de compilation :\n${comp.stderr}` };
       return await runProcess(exe, [], { cwd: dir, stdin, timeoutMs });
     }
