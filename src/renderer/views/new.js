@@ -47,6 +47,7 @@ function template() {
       <div style="flex:1">
         <div id="progress-title" style="font-weight:600;color:#fff">Correction en cours…</div>
         <div class="bar"><div id="progress-bar"></div></div>
+        <div id="progress-live" class="progress-live hidden"></div>
         <ul id="progress-log" class="progress-log"></ul>
       </div>
       <button class="btn sm" id="btn-cancel"><i class="fa-solid fa-xmark"></i>Annuler</button>
@@ -87,6 +88,25 @@ async function normalizeParts(f, parts) {
   return out;
 }
 
+/** Les images sont transcrites dès l'import, en arrière-plan : la correction démarre ensuite sans attendre. */
+function preread(f) {
+  const images = f.parts.filter((p) => p.type === 'image');
+  if (!images.length || state.settings?.preread === false || !state.settings?.hasApiKey) return;
+  api.prepImages([{ name: f.name, parts: images }]).catch(() => {});
+}
+
+const STATUT_ICON = { correct: '✅', partiel: '🟠', incorrect: '❌', non_traite: '⬜' };
+const fmt = (n) => String(Math.round(Number(n) * 100) / 100).replace('.', ',');
+function renderLive(p) {
+  const box = $('#progress-live');
+  if (!box || !p) return;
+  const qs = p.questions || [];
+  if (!qs.length && !p.note && !p.titre) return;
+  box.classList.remove('hidden');
+  box.innerHTML = `${p.titre ? `<div class="live-title">${esc(p.titre)}</div>` : ''}${p.note ? `<div class="live-note">Note provisoire : <b>${fmt(p.note.obtenue)}/${p.note.sur}</b></div>` : ''}
+    <ul class="live-q">${qs.map((q) => `<li>${STATUT_ICON[q.statut] || '•'} <b>${esc(q.numero)}</b> ${esc(String(q.intitule || '').slice(0, 70))} <span class="dim">${fmt(q.points_obtenus)}/${fmt(q.points_max)}</span></li>`).join('')}</ul>`;
+}
+
 function summarize(f) {
   const count = (t) => f.parts.filter((p) => p.type === t).length;
   const chars = f.parts.filter((p) => p.type === 'text').reduce((s, p) => s + p.text.length, 0);
@@ -106,6 +126,7 @@ async function processFile(f) {
     f.warnings = res.warnings || [];
     f.parts = await normalizeParts(f, res.parts);
     summarize(f);
+    preread(f);
   } catch (err) {
     f.status = 'error';
     f.info = err.message;
@@ -120,6 +141,7 @@ export async function addMemoryFile(name, mime, base64) {
   renderFiles();
   f.parts = await normalizeParts(f, [{ type: mime === 'application/pdf' ? 'pdf' : 'image', mime, base64, label: name }]);
   summarize(f);
+  preread(f);
   renderFiles();
 }
 
@@ -176,13 +198,20 @@ async function runCorrection() {
   $('#progress-log').innerHTML = '';
   $('#progress-bar').style.width = '4%';
   $('#progress-title').textContent = 'Préparation…';
+  $('#progress-live').classList.add('hidden');
+  $('#progress-live').innerHTML = '';
   prog.scrollIntoView({ behavior: 'smooth', block: 'center' });
   unlisten = api.onProgress((p) => {
+    // Résultat qui s'affiche au fur et à mesure (questions déjà corrigées)
+    if (p.step === 'partial') {
+      renderLive(p.partial);
+      return;
+    }
     $('#progress-title').textContent = p.message;
     const li = document.createElement('li');
     li.textContent = p.message;
     $('#progress-log').appendChild(li);
-    const pct = { models: 8, vision: 10 + 35 * ((p.done || 0) / (p.total || 1)), audio: 48, tests: 55, correction: 70, save: 97 }[p.step] ?? 10;
+    const pct = { models: 8, vision: 10 + 35 * ((p.done || 0) / (p.total || 1)), audio: 48, index: 52, correction: 62, synthese: 80, tests: 82, revision: 88, rescue: 90, save: 97 }[p.step] ?? 10;
     $('#progress-bar').style.width = `${pct}%`;
   });
   try {

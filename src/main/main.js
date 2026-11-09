@@ -12,7 +12,8 @@ if (!app.isPackaged && !app.commandLine.hasSwitch('user-data-dir')) {
 const { extractFile } = require('./extractors');
 const { Database } = require('./db');
 const { Settings } = require('./settings');
-const { correct, recorrect, buildName, generateFlashcards, generateExercise, chatAbout, locateFaultsOnImage } = require('./corrector');
+const { correct, recorrect, buildName, generateFlashcards, generateExercise, chatAbout, locateFaultsOnImage, generateModelAnswer, prereadImages } = require('./corrector');
+const { VisionCache } = require('./visioncache');
 const pages = require('./pages');
 const { Queue } = require('./queue');
 const { createProvider, PROVIDERS } = require('./providers');
@@ -92,6 +93,8 @@ async function buildContext({ needVision = false, needAudio = false, progress = 
   progress({ step: 'models', message: `Vérification des modèles disponibles chez ${PROVIDERS[s.provider].label}…` });
   const corr = await resolver.resolveCorrection(ai, s.correctionModel);
   notes.push(...corr.notes);
+  // Modèle rapide pour les tâches secondaires (repérage, résumé, synthèse, fiches)
+  const fast = await resolver.resolveFast(ai, corr.main).catch(() => null);
   let vision = null;
   if (needVision) {
     progress({ step: 'models', message: 'Recherche d\'un modèle capable de lire les images…' });
@@ -111,7 +114,19 @@ async function buildContext({ needVision = false, needAudio = false, progress = 
       } catch { /* suivant */ }
     }
   }
-  return { ai, audioAi, models: { main: corr.main, fallbacks: corr.fallbacks, vision, audio }, limits: (model) => book.limits(s.provider, model), s, progress, signal, notes, ocr: ocr.ocrImage };
+  return { ai, audioAi, models: { main: corr.main, fallbacks: corr.fallbacks, fast, vision, audio }, limits: (model) => book.limits(s.provider, model), s, progress, signal, notes, ocr: ocr.ocrImage, visionCache, startedAt: Date.now() };
+}
+
+let visionCache = null;
+
+async function warmup() {
+  if (settings.public().hasApiKey) {
+    const ctx = await buildContext({ needVision: true }).catch(() => null);
+    if (ctx) console.log('Préchauffage : modèles', ctx.models.main, ctx.models.fast || '-', ctx.models.vision || '-');
+  }
+  if (settings.prefs.executeCode !== false) {
+    await runner.warmup();
+  }
 }
 
 const hasType = (files, t) => files.some((f) => f.parts.some((p) => p.type === t));
@@ -162,12 +177,29 @@ function autoFlashcards(ctx, id, result, counted = true) {
     .catch((err) => console.warn('Fiches de révision :', err.message));
 }
 
+/** Correction modèle rédigée en arrière-plan, après l'affichage de la note. */
+function backgroundModelAnswer(ctx, id, out) {
+  if (out.result.correction_modele) return;
+  generateModelAnswer({ ...ctx, progress: () => {}, notes: [], signal: undefined }, out.result, out.sources)
+    .then((text) => {
+      const t = text?.trim() || '';
+      db.patchResult(id, { correction_modele: t || '_Correction modèle indisponible._' });
+      send('correction:model', { id, text: t });
+    })
+    .catch((err) => {
+      console.warn('Correction modèle :', err.message);
+      db.patchResult(id, { correction_modele: '' });
+      send('correction:model', { id, text: '', error: err.message });
+    });
+}
+
 /** Une correction complète (utilisée par le bouton « Corriger » et par la file d'attente). */
 async function runCorrectionTask({ files, consigne = '', previews = [], folderId = null, counted = true }, { progress, signal }) {
   const ctx = await buildContext({ needVision: hasType(files, 'image'), needAudio: hasType(files, 'audio'), progress, signal });
   const out = await correct(ctx, { files, consigne, runCode: runner.runCode });
   progress({ step: 'save', message: 'Enregistrement dans l\'historique…' });
   const id = await saveAndCards(out, { files: files.map((f) => ({ name: f.name, role: f.role || 'auto' })), consigne, previews, folderId: counted ? folderId : null, counted });
+  backgroundModelAnswer(ctx, id, out);
   autoFlashcards(ctx, id, out.result, counted);
   return { id, warnings: out.warnings };
 }
@@ -202,6 +234,18 @@ function registerIpc() {
     return r.canceled ? [] : r.filePaths;
   });
   handle('files:extract', (p) => extractFile(p));
+  // Pré-lecture des images dès l'import : la correction démarre ensuite sans attendre la vision
+  handle('prep:images', async (files) => {
+    if (!settings.prefs.preread || !settings.public().hasApiKey) return 0;
+    try {
+      const ctx = await buildContext({ needVision: true });
+      if (!ctx.models.vision) return 0;
+      return await prereadImages(ctx, files);
+    } catch (err) {
+      console.warn('Pré-lecture :', err.message);
+      return 0;
+    }
+  });
 
   // ---- Correction ----
   const progress = (data) => send('correct:progress', data);
@@ -279,6 +323,7 @@ function registerIpc() {
       const ctx = await buildContext({ progress, signal: currentAbort.signal });
       const out = await recorrect(ctx, { sources: rec.sources, consigne: rec.consigne, runCode: runner.runCode });
       const newId = await saveAndCards(out, { files: rec.files, consigne: rec.consigne, folderId: rec.folder_id, kind: rec.kind, exerciseId: rec.exercise_id, nameSuffix: ' (re-correction)', pagesList: rec.pages, counted: !!rec.counted, exerciseKey: rec.exercise_key });
+      backgroundModelAnswer(ctx, newId, out);
       return { id: newId, warnings: out.warnings };
     } finally {
       currentAbort = null;
@@ -291,6 +336,14 @@ function registerIpc() {
   });
 
   handle('run:code', (payload) => runner.runCode(payload));
+  handle('correct:modelAnswer', async (id) => {
+    const rec = db.getCorrection(id);
+    if (!rec) throw new Error('Correction introuvable.');
+    const ctx = await buildContext({});
+    const text = (await generateModelAnswer(ctx, rec.result, rec.sources)).trim();
+    db.patchResult(id, { correction_modele: text });
+    return text;
+  });
 
   // ---- Modèles ----
   handle('models:describe', async (providerId, force = true) => {
@@ -363,6 +416,7 @@ function registerIpc() {
       const ctx = await buildContext({ needVision: hasType(all, 'image'), needAudio: hasType(all, 'audio'), progress, signal: currentAbort.signal });
       const out = await correct(ctx, { files: all, consigne: 'Exercice d\'entraînement généré par l\'application.', runCode: runner.runCode });
       const cid = await saveAndCards(out, { files: all.map((f) => ({ name: f.name, role: f.role })), consigne: '', kind: 'practice', exerciseId: id, exerciseUuid: ex.uuid, nameSuffix: ' (entraînement)', previews, counted });
+      backgroundModelAnswer(ctx, cid, out);
       db.updateExercise(id, counted ? { doneCorrectionId: cid, draft: answer || '' } : { draft: answer || '' });
       autoFlashcards(ctx, cid, out.result, counted);
       return { id: cid, warnings: out.warnings };
@@ -491,6 +545,7 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     dataDir = app.getPath('userData');
     runner.setDataDir(dataDir);
+    visionCache = new VisionCache(path.join(dataDir, 'cache', 'vision'));
     settings = new Settings(path.join(dataDir, 'settings.json'), safeStorage);
     resolver = new ModelResolver(settings.modelStore());
     book = new LimitBook(settings.limitStore());
@@ -525,6 +580,8 @@ if (!gotLock) {
       }
     });
     queue.resume();
+    // Préchauffage : modèles vérifiés et moteurs Python / SQL chargés pendant que tu ajoutes tes fichiers
+    setTimeout(() => warmup().catch(() => {}), 2500);
     // Synchronisation au démarrage (récupère les corrections faites sur les autres PC)
     if (settings.get('syncDir')) {
       backup.syncFolder(db, settings, app.getVersion(), { dataDir }).then((s) => s && send('sync:status', s)).catch((err) => send('sync:status', { error: err.message }));

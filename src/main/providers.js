@@ -109,6 +109,7 @@ class OpenAICompatible {
       }
       if (res.ok) {
         if (init.model) this.book.fromHeaders(this.id, init.model, res.headers);
+        if (init.raw) return res;
         return res.json();
       }
       const text = await res.text();
@@ -148,7 +149,53 @@ class OpenAICompatible {
       : { type: 'text', text: c.text }));
   }
 
-  async chat({ model, system, messages, json = false, maxTokens = 8192, effort, signal, temperature = 0.2, onWait }) {
+  /** Lit une réponse en flux (Server-Sent Events) et transmet le texte au fur et à mesure. */
+  static async readStream(res, onDelta) {
+    const ct = res.headers?.get?.('content-type') || '';
+    if (!res.body?.getReader || !/event-stream/.test(ct)) {
+      const data = await res.json();
+      const choice = data.choices?.[0];
+      const content = choice?.message?.content || '';
+      if (content) onDelta?.(content, content);
+      return { content, finishReason: choice?.finish_reason, model: data.model };
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let content = '';
+    let finishReason = null;
+    let modelName = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const j = JSON.parse(payload);
+          if (j.error) throw new AIError(j.error.message || 'Erreur de flux', 500, j.error.code || '');
+          const ch = j.choices?.[0];
+          modelName ||= j.model;
+          const d = ch?.delta?.content || '';
+          if (d) {
+            content += d;
+            onDelta?.(d, content);
+          }
+          if (ch?.finish_reason) finishReason = ch.finish_reason;
+        } catch (e) {
+          if (e instanceof AIError) throw e;
+        }
+      }
+    }
+    return { content, finishReason, model: modelName };
+  }
+
+  async chat({ model, system, messages, json = false, maxTokens = 8192, effort, signal, temperature = 0.2, onWait, onDelta }) {
     // Jamais plus que la sortie maximale connue du modèle
     maxTokens = Math.max(16, Math.min(maxTokens, this.book.limits(this.id, model).maxOut));
     await this.book.waitFor(this.id, model, estimateMessages(system, messages) + maxTokens, { onWait, signal });
@@ -162,19 +209,27 @@ class OpenAICompatible {
     if (this.id !== 'openai') body.temperature = temperature;
     if (json) body.response_format = { type: 'json_object' };
     if (effort && /gpt-oss/.test(model)) body.reasoning_effort = effort;
-    let data;
+    // Réponse en flux si l'appelant veut l'afficher au fur et à mesure
+    if (onDelta) body.stream = true;
+    const send = async () => {
+      const res = await this.request('/chat/completions', { method: 'POST', model, raw: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, { signal });
+      return OpenAICompatible.readStream(res, onDelta);
+    };
+    let out;
     try {
-      data = await this.request('/chat/completions', { method: 'POST', model, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, { signal });
+      out = await send();
     } catch (err) {
-      // Certains modèles n'acceptent pas le mode JSON ou reasoning_effort : nouvel essai sans
-      if (err.status === 400 && (body.response_format || body.reasoning_effort) && /response_format|json|reasoning/i.test(err.message)) {
-        delete body.response_format;
-        delete body.reasoning_effort;
-        data = await this.request('/chat/completions', { method: 'POST', model, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, { signal });
+      // Certains modèles n'acceptent pas le mode JSON, reasoning_effort ou le flux : nouvel essai sans
+      if (err.status === 400 && (body.response_format || body.reasoning_effort || body.stream) && /response_format|json|reasoning|stream/i.test(err.message)) {
+        if (/stream/i.test(err.message)) delete body.stream;
+        else {
+          delete body.response_format;
+          delete body.reasoning_effort;
+        }
+        out = await send();
       } else throw err;
     }
-    const choice = data.choices?.[0];
-    return { content: choice?.message?.content || '', finishReason: choice?.finish_reason, model: data.model || model };
+    return { content: out.content, finishReason: out.finishReason, model: out.model || model };
   }
 
   async transcribe({ base64, filename, mime, model, signal }) {
@@ -230,7 +285,7 @@ class AnthropicProvider {
     return e;
   }
 
-  async chat({ model, system, messages, maxTokens = 16000, effort, signal }) {
+  async chat({ model, system, messages, maxTokens = 16000, effort, signal, onDelta }) {
     const msgs = messages.map((m) => ({
       role: m.role,
       content: typeof m.content === 'string' ? m.content : m.content.map((c) => (c.type === 'image'
@@ -252,6 +307,13 @@ class AnthropicProvider {
     try {
       // Streaming : évite les délais d'attente HTTP sur les longues corrections
       const stream = this.client.beta.messages.stream(params, { signal });
+      if (onDelta) {
+        let acc = '';
+        stream.on('text', (d) => {
+          acc += d;
+          onDelta(d, acc);
+        });
+      }
       res = await stream.finalMessage();
     } catch (err) {
       // Paramètres bêta non acceptés par ce modèle : nouvel essai sans eux

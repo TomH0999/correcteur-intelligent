@@ -240,7 +240,14 @@ async function runSql(code) {
   }
 }
 
-parentPort.on('message', async ({ id, language, code, stdin, files }) => {
+// Une exécution à la fois : Python et le moteur SQL partagent leur sortie (stdout) entre les appels
+let chain = Promise.resolve();
+parentPort.on('message', (msg) => {
+  chain = chain.then(() => execute(msg), () => execute(msg));
+});
+
+async function execute({ id, language, code, stdin, files }) {
+  parentPort.postMessage({ id, started: true }); // le délai maximal court à partir d'ici (pas pendant l'attente)
   const t = Date.now();
   let res;
   try {
@@ -251,4 +258,4 @@ parentPort.on('message', async ({ id, language, code, stdin, files }) => {
     res = { ok: false, stdout: '', stderr: String(e.message || e), exitCode: 1 };
   }
   parentPort.postMessage({ id, ...res, durationMs: Date.now() - t });
-});
+}

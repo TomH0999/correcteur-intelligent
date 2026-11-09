@@ -357,6 +357,16 @@ class Database {
     return this.getCorrection(id);
   }
 
+  /** Complète le résultat enregistré (ex. correction modèle générée après coup). */
+  patchResult(id, fields) {
+    const row = this.get('SELECT result FROM corrections WHERE id = ?', [id]);
+    if (!row) return null;
+    const result = { ...JSON.parse(row.result || '{}'), ...fields };
+    this.x('UPDATE corrections SET result = ? WHERE id = ?', [JSON.stringify(result), id]);
+    this.persist();
+    return result;
+  }
+
   deleteCorrection(id) {
     this.run('DELETE FROM corrections WHERE id = ?', [id]);
   }

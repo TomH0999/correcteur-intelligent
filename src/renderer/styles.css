@@ -253,6 +253,13 @@ input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; accent-color:
 .bar { height: 6px; background: var(--s800); border-radius: 6px; overflow: hidden; margin: 8px 0; }
 .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--brand600), var(--brand400)); transition: width .4s; }
 .progress-log { margin: 8px 0 0; padding-left: 18px; color: var(--s400); font-size: 12px; max-height: 150px; overflow: auto; }
+.progress-live { margin: 10px 0 0; padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.04); border: 1px solid var(--border, rgba(255,255,255,.08)); font-size: 13px; max-height: 220px; overflow: auto; }
+.progress-live .live-title { font-weight: 600; color: #fff; }
+.progress-live .live-note { margin: 2px 0 6px; color: var(--s300, #cbd5e1); }
+.progress-live .live-q { list-style: none; margin: 0; padding: 0; }
+.progress-live .live-q li { padding: 2px 0; }
+.timings { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.model-wait { display: flex; align-items: center; gap: 10px; color: var(--s400); }
 .spinner { width: 26px; height: 26px; border: 3px solid var(--s700); border-top-color: var(--brand500); border-radius: 50%; animation: spin .8s linear infinite; flex-shrink: 0; }
 .spinner.sm { width: 18px; height: 18px; border-width: 2px; }
 @keyframes spin { to { transform: rotate(360deg); } }

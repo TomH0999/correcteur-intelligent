@@ -102,10 +102,12 @@ class Settings {
   }
 
   update(prefs) {
-    const allowed = ['provider', 'correctionModel', 'visionModel', 'audioModel', 'maxInputChars', 'gradeMax', 'level', 'severity', 'reasoningEffort', 'pdfMode', 'executeCode', 'autoFlashcards', 'ollamaUrl'];
+    const allowed = ['provider', 'correctionModel', 'visionModel', 'audioModel', 'maxInputChars', 'gradeMax', 'level', 'severity', 'reasoningEffort', 'speedMode', 'preread', 'pdfMode', 'executeCode', 'autoFlashcards', 'ollamaUrl'];
     const clean = {};
     for (const k of allowed) if (prefs[k] !== undefined) clean[k] = prefs[k];
     if (clean.provider && !PROVIDERS[clean.provider]) delete clean.provider;
+    if (clean.speedMode && !['rapide', 'equilibre', 'approfondi'].includes(clean.speedMode)) delete clean.speedMode;
+    if (clean.preread !== undefined) clean.preread = !!clean.preread;
     if (clean.maxInputChars) clean.maxInputChars = Math.max(4000, Math.min(800000, Number(clean.maxInputChars) || DEFAULTS.maxInputChars));
     if (clean.gradeMax) clean.gradeMax = Math.max(1, Math.min(1000, Number(clean.gradeMax) || 20));
     this.data.prefs = { ...this.data.prefs, ...clean };

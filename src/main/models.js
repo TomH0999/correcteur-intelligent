@@ -20,6 +20,15 @@ const PREFERRED = {
   ollama: { correction: ['qwen3', 'gpt-oss', 'llama3.3', 'mistral', 'gemma3'], vision: ['qwen2.5vl', 'qwen3-vl', 'llama3.2-vision', 'gemma3', 'llava', 'minicpm-v'] }
 };
 
+// Modèles rapides pour les tâches secondaires (repérage des questions, résumé, synthèse, fiches)
+const FAST = {
+  groq: ['openai/gpt-oss-20b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant'],
+  anthropic: ['claude-haiku-5-5', 'claude-haiku-5', 'claude-haiku-4-5'],
+  openai: ['gpt-5-mini', 'gpt-5-nano', 'gpt-4.1-mini', 'gpt-4o-mini'],
+  gemini: ['gemini-3-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'],
+  ollama: []
+};
+
 const NON_CHAT = /whisper|tts|speech|transcri|audio|realtime|embed|guard|moderation|playai|orpheus|distil|dall-e|image-|imagen|veo|aqa|search|computer-use|davinci|babbage|codex-mini|prompt-guard|safeguard|compound/i;
 const VISION_HINT = /vision|[-_.]vl\b|vl[-:]|llava|scout|maverick|qwen3\.\d+-\d+b|muse|gemma-?3|pixtral|minicpm-v|moondream|claude|gpt-4o|gpt-4\.1|gpt-5|gemini/i;
 
@@ -169,6 +178,14 @@ class ModelResolver {
     return { model: null, notes };
   }
 
+  /** Modèle rapide (tâches secondaires) présent sur le compte, sinon null (le modèle principal est utilisé). */
+  async resolveFast(provider, main) {
+    const models = await this.available(provider);
+    if (!models.length) return null;
+    const m = matchPreferred(FAST[provider.id] || [], models)[0];
+    return m && m !== main ? m : null;
+  }
+
   async resolveAudio(provider, wanted) {
     if (!PROVIDERS[provider.id].audio) return null;
     const models = await this.available(provider);
@@ -178,4 +195,4 @@ class ModelResolver {
   }
 }
 
-module.exports = { ModelResolver, rankCorrection, rankVision, chatModels, matchPreferred, probeVision, PREFERRED };
+module.exports = { ModelResolver, rankCorrection, rankVision, chatModels, matchPreferred, probeVision, PREFERRED, FAST };

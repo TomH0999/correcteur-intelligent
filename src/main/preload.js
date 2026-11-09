@@ -22,6 +22,9 @@ contextBridge.exposeInMainWorld('api', {
   recorrect: (id) => invoke('correct:rerun', id),
   cancel: () => invoke('correct:cancel'),
   onProgress: on('correct:progress'),
+  prepImages: (files) => invoke('prep:images', files),
+  onModelAnswer: on('correction:model'),
+  modelAnswer: (id) => invoke('correct:modelAnswer', id),
   runCode: (payload) => invoke('run:code', payload),
   // Modèles
   describeModels: (provider, force) => invoke('models:describe', provider, force),

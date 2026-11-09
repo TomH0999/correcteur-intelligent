@@ -30,7 +30,7 @@ async function pageText(page) {
   return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-async function hasFigures(page) {
+async function hasFigures(page, textLen = 0) {
   try {
     const ops = await page.getOperatorList();
     const O = pdfjsLib.OPS;
@@ -39,7 +39,8 @@ async function hasFigures(page) {
       if (fn === O.paintImageXObject || fn === O.paintInlineImageXObject || fn === O.paintImageMaskXObject) return true;
       if (fn === O.constructPath) paths++;
     }
-    return paths > 60; // dessin vectoriel conséquent (schéma, graphe, MCD…)
+    // Dessin vectoriel conséquent (schéma, graphe, MCD…) ; une page très textuelle avec des tableaux en a davantage
+    return paths > (textLen > 1500 ? 200 : 60);
   } catch {
     return false;
   }
@@ -107,7 +108,7 @@ export async function processPdf(base64, label, mode = 'auto', onPage = () => {}
     if (text) parts.push({ type: 'text', text, label: pageLabel, fromPdf: true });
     let needImage = false;
     if (mode === 'always') needImage = true;
-    else if (mode === 'auto') needImage = text.replace(/\s/g, '').length < 200 || (await hasFigures(page));
+    else if (mode === 'auto') needImage = text.replace(/\s/g, '').length < 200 || (await hasFigures(page, text.length));
     if (needImage) {
       if (rendered < MAX_RENDERED_PAGES) {
         parts.push({ type: 'image', mime: 'image/jpeg', base64: await renderPage(page), label: `${pageLabel} (image)` });

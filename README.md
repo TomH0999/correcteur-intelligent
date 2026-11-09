@@ -11,7 +11,7 @@ dans n'importe quel format — et l'application :
    (testé automatiquement), OCR local de secours, transcription audio… ;
 2. **détermine elle-même** ce qui est l'énoncé, ta copie et le barème ;
 3. **exécute réellement ton code** (Python, JavaScript, SQL intégrés ; Java, C, C++, PHP si installés) avec des tests
-   préparés par l'IA ;
+   préparés par l'IA pendant la correction ;
 4. renvoie une **note** et un **score**, le **détail par question**, un **rapport de fautes**, des **améliorations**,
    les **notions à revoir** et une **correction modèle** (LaTeX et code mis en forme) ;
 5. **enregistre** chaque correction dans l'historique (base SQLite locale) avec un nom précis et recherchable,
@@ -38,6 +38,8 @@ dans n'importe quel format — et l'application :
 | 🖍️ **Copie annotée** | Les fautes sont surlignées directement sur ta copie : par le texte pour les PDF, par l'IA de vision pour les photos/scans, dans le texte pour le code. |
 | 🧩 **Gros devoirs** | Si les documents dépassent les limites du modèle (sortie max, jetons par minute de l'offre gratuite), la correction est automatiquement découpée : lecture document par document, correction par lots de questions, synthèse finale. |
 | ⚖️ **Pas de fausses erreurs** | Le code est exécuté sur de vrais moteurs : **PostgreSQL embarqué** avec conversion automatique d'Oracle (MINUS, NVL, DECODE, DUAL, ROWNUM, séquences, PL/SQL, scripts SQL*Plus…), MySQL et SQL Server ; vrai Node.js pour JavaScript/TypeScript ; Python avec bibliothèques. Les erreurs dues à l'outil (dialecte non convertible, saisie clavier non fournie, module absent…) sont signalées « limite de l'outil » et ne coûtent jamais de points. |
+| 🔗 **Réponses bien rattachées** | Ta numérotation peut différer de l'énoncé (« Q3 » pour « Exercice 2 – Question 1 », « 3) », « II.1 », réponses sans numéro) : chaque réponse est rattachée à la bonne question. Si des questions restent « non traitées », l'IA les recherche à nouveau dans toute ta copie avant de noter. |
+| ⚡ **Correction rapide** | Images lues dès l'import (et mises en cache), tests de code écrits pendant la correction, modèle rapide pour les tâches secondaires, lots en parallèle quand ton offre le permet, note affichée au fur et à mesure, correction modèle rédigée après l'affichage de la note. Réglage **Rapide / Équilibré / Approfondi** et durée de chaque étape affichée. Astuce : l'offre payante de Groq (Dev tier) supprime presque toutes les pauses liées aux jetons par minute. |
 | 📝 **Brouillons** | Case « Enregistrer » : décochée, la correction s'affiche mais ne compte ni dans l'historique, ni dans les statistiques, ni dans les fiches (supprimée après 14 jours, enregistrable après coup). |
 | 🎯 **Réussite & amélioration** | Les copies d'un même énoncé sont regroupées en tentatives : taux de réussite du premier coup, amélioration de la 1re à la dernière réponse, exercices rattrapés (corrections enregistrées uniquement). |
 | 🛟 **Données protégées** | Conservées lors des mises à jour, sauvegarde automatique quotidienne et avant chaque mise à jour / réinitialisation, bouton de réinitialisation avec confirmation. |

@@ -34,41 +34,84 @@ function setDataDir(d) {
   dataDir = d;
 }
 let seq = 0;
+let stopping = false;
 const pending = new Map();
 
 function getWorker() {
   if (worker) return worker;
   // Le worker est décompressé hors de l'archive asar (voir build.asarUnpack)
-  worker = new Worker(path.join(__dirname.replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`), 'runner-worker.js'), { env: { ...process.env, CORRECTEUR_DATA: dataDir || '' } });
-  worker.unref();
-  worker.on('message', (m) => {
+  const w = new Worker(path.join(__dirname.replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`), 'runner-worker.js'), { env: { ...process.env, CORRECTEUR_DATA: dataDir || '' } });
+  worker = w;
+  w.loaded = new Set(); // moteurs déjà chargés dans ce worker
+  w.unref();
+  w.on('message', (m) => {
     const p = pending.get(m.id);
+    if (p && m.started) {
+      p.start?.();
+      return;
+    }
     if (p) {
       pending.delete(m.id);
+      if (p.language) w.loaded.add(p.language);
       p.resolve(m);
     }
   });
-  worker.on('error', (err) => {
+  w.on('error', (err) => {
     for (const p of pending.values()) p.resolve({ ok: false, stdout: '', stderr: String(err.message || err), exitCode: 1 });
     pending.clear();
-    worker = null;
+    if (worker === w) worker = null;
   });
-  worker.on('exit', () => { worker = null; });
+  w.on('exit', () => {
+    // Exécutions en attente derrière un programme coupé (boucle infinie) : relancées sur un nouveau moteur
+    const waiting = [...pending.entries()].filter(([, p]) => p.w === w);
+    if (worker === w) worker = null;
+    for (const [id, p] of waiting) {
+      pending.delete(id);
+      if (stopping) p.resolve({ ok: false, stdout: '', stderr: 'Exécution interrompue.', exitCode: 1, internal: true, category: 'outil', explication: 'Moteur d\'exécution arrêté.' });
+      else p.retry();
+    }
+  });
   return worker;
+}
+
+// Bibliothèques Python téléchargées à la première utilisation (délai supplémentaire)
+const PY_PACKAGES = /^\s*(?:import|from)\s+(numpy|pandas|matplotlib|scipy|sympy|networkx|sklearn|scikit|PIL|regex|bs4|yaml|lxml|statsmodels|seaborn|pytz|dateutil)\b/m;
+
+/** Délai supplémentaire pour charger le moteur (et les bibliothèques) quand il ne l'est pas encore. */
+function loadAllowance(w, language, code) {
+  if (language === 'python') return !w.loaded.has('python') || PY_PACKAGES.test(code) ? 50000 : 0;
+  if (language === 'sql') return w.loaded.has('sql') ? 0 : 15000;
+  return 0;
 }
 
 function runBuiltin(language, code, stdin, timeoutMs, files) {
   return new Promise((resolve) => {
     const id = ++seq;
-    const w = getWorker();
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      w.terminate(); // boucle infinie : on détruit le worker (il sera recréé)
-      worker = null;
-      resolve({ ok: false, stdout: '', stderr: `Temps d'exécution dépassé (${timeoutMs / 1000} s) : boucle infinie ou programme trop lent.`, exitCode: -1, timedOut: true, durationMs: timeoutMs });
-    }, timeoutMs + (language === 'python' ? 50000 : language === 'sql' ? 15000 : 0)); // + chargement de Python / PostgreSQL et des bibliothèques la 1re fois
-    pending.set(id, { resolve: (r) => { clearTimeout(timer); resolve(r); } });
-    w.postMessage({ id, language, code, stdin, files });
+    const msg = { id, language, code, stdin, files };
+    let timer = null;
+    const send = (w) => {
+      // extra : marge pendant l'attente dans la file du worker ; remise à zéro quand l'exécution démarre
+      const arm = (extra = 0) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          pending.delete(id);
+          w.terminate(); // boucle infinie : on détruit le worker (il sera recréé)
+          if (worker === w) worker = null;
+          resolve({ ok: false, stdout: '', stderr: `Temps d'exécution dépassé (${timeoutMs / 1000} s) : boucle infinie ou programme trop lent.`, exitCode: -1, timedOut: true, durationMs: timeoutMs });
+        }, timeoutMs + loadAllowance(w, language, code) + extra);
+      };
+      arm(120000); // sécurité si le worker ne répond plus du tout
+      pending.set(id, {
+        start: () => arm(),
+        w,
+        language,
+        resolve: (r) => { clearTimeout(timer); resolve(r); },
+        // Le worker a été relancé (programme précédent coupé) : on réexécute sur le nouveau
+        retry: () => send(getWorker())
+      });
+      w.postMessage(msg);
+    };
+    send(getWorker());
   });
 }
 
@@ -218,11 +261,19 @@ async function runCode({ language, code, stdin = '', timeoutMs = 10000, files = 
   return { language: lang, ...r, internal: cls.internal, category: cls.category, explication: cls.explication };
 }
 
+/** Charge Python et PostgreSQL en arrière-plan pour que la 1re exécution soit immédiate. */
+async function warmup() {
+  await runBuiltin('python', 'pass', '', 10000, {}).catch(() => {});
+  await runBuiltin('sql', 'SELECT 1;', '', 10000, {}).catch(() => {});
+}
+
 const RUNNABLE = ['python', 'javascript', 'typescript', 'sql', 'java', 'c', 'cpp', 'php'];
 
 async function shutdown() {
+  stopping = true;
   if (worker) await worker.terminate();
   worker = null;
+  stopping = false;
 }
 
-module.exports = { runCode, normalizeLanguage, RUNNABLE, shutdown, setDataDir, prepareJava };
+module.exports = { runCode, normalizeLanguage, RUNNABLE, shutdown, setDataDir, prepareJava, warmup };

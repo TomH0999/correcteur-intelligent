@@ -2,8 +2,10 @@
 /**
  * Pipeline de correction :
  *  1. lecture des images (modèle de vision vérifié, sinon OCR local) et transcription audio ;
- *  2. (option) vérification par exécution réelle du code de l'étudiant ;
- *  3. identification énoncé / réponses / barème + correction détaillée en JSON ;
+ *  2. identification énoncé / réponses / barème + correction détaillée en JSON (tests de code intégrés) ;
+ *  3. exécution réelle des tests, révision ciblée si un test contredit la note ;
+ *  4. rattrapage des questions marquées « non traitées » (réponse numérotée autrement) ;
+ *  5. correction modèle générée après l'affichage de la note.
  * + générateurs : fiches de révision (flashcards) et exercices d'entraînement.
  */
 const { AIError } = require('./providers');
@@ -19,6 +21,8 @@ const DEFAULTS = {
   level: 'BUT Informatique — 1re année',
   severity: 'normale',
   reasoningEffort: 'medium',
+  speedMode: 'equilibre',
+  preread: true,
   executeCode: true,
   autoFlashcards: true
 };
@@ -48,7 +52,7 @@ Règles :
 - Indique en première ligne la nature de l'image entre crochets : [énoncé imprimé], [copie manuscrite], [capture de code], [schéma], [barème], [mélange énoncé + réponses], etc.
 Réponds uniquement avec la transcription, sans commentaire ni correction.`;
 
-function buildSystemPrompt(s) {
+function buildSystemPrompt(s, { withTests = false } = {}) {
   return `Tu es un correcteur expert et bienveillant pour des étudiants en ${s.level} (France).
 Tu maîtrises tout le programme du BUT Informatique : mathématiques (analyse, algèbre linéaire, probabilités, graphes, logique, arithmétique modulaire), algorithmique et programmation (Python, Java, C, C#, JavaScript/TypeScript, PHP…), développement web, bases de données (Merise MCD/MLD/MPD, modèle relationnel, normalisation, algèbre relationnelle, SQL, PL/SQL, NoSQL), réseaux (adressage IPv4/IPv6, sous-réseaux, routage, modèle OSI/TCP-IP), systèmes (Linux, shell, processus), architecture des ordinateurs, génie logiciel (UML, tests, design patterns, Git), ainsi que les matières transverses (anglais, communication, gestion, droit).
 
@@ -56,12 +60,12 @@ TA MISSION
 On te fournit un ou plusieurs documents (déjà convertis en texte ; les images ont été transcrites automatiquement, des erreurs de transcription sont possibles).
 1. IDENTIFIE toi-même ce qui relève de l'ÉNONCÉ (sujet, consignes, questions), des RÉPONSES de l'étudiant et, s'il y en a, du BARÈME / CORRIGÉ DU PROFESSEUR. Un même fichier peut contenir plusieurs de ces éléments ; un énoncé peut aussi être absent : dans ce cas, déduis les questions à partir des réponses et signale-le.
 2. CORRIGE chaque question/exercice : vérifie l'exactitude (calculs refaits étape par étape, code exécuté mentalement avec des cas limites, requêtes SQL vérifiées sur leur logique, schémas confrontés aux règles de modélisation), la méthode, la rigueur, la rédaction et les bonnes pratiques.
-3. Si des RÉSULTATS D'EXÉCUTION RÉELLE du code sont fournis, appuie-toi dessus en priorité (ce sont des faits) et cite-les dans tes commentaires. Attention : un échec peut venir du programme de test et non de l'étudiant ; juge avec discernement.
+3. RATTACHE chaque réponse à sa question : la numérotation de l'étudiant peut différer de l'énoncé (« Q3 » pour « Exercice 2 – Question 3 », « 3) », « II.1 »…), l'ordre peut changer, la question peut être recopiée avant la réponse ou la réponse ne pas être numérotée. Cherche dans TOUTE la copie avant de marquer une question « non_traite ».
 4. NOTE de façon juste sur ${s.gradeMax}. Si un barème ou un corrigé du professeur est fourni, APPLIQUE-LE STRICTEMENT (mêmes points par question, mêmes attendus) puis ramène la note sur ${s.gradeMax}. Sinon respecte le barème de l'énoncé s'il existe, ou répartis les points de manière cohérente. Sévérité demandée : ${s.severity}. Une erreur de transcription évidente (OCR) ne doit pas être sanctionnée ; signale-la plutôt.
-5. Rédige un RAPPORT DE FAUTES précis, des AMÉLIORATIONS possibles et une liste de NOTIONS À REVOIR, puis une CORRECTION MODÈLE complète.
+5. Rédige un RAPPORT DE FAUTES précis, des AMÉLIORATIONS possibles et une liste de NOTIONS À REVOIR (la correction modèle est rédigée à part : ne l'écris pas).
 
 ${FAIRNESS_RULES}
-
+${withTests ? `\n${TESTS_SPEC}\n` : ''}
 RÈGLES DE FORME
 - Tout en français, ton pédagogique, direct, concret. Tutoie l'étudiant.
 - Markdown autorisé dans les champs texte. Maths en LaTeX entre $…$ ou $$…$$. Code dans des blocs \`\`\`langage.
@@ -94,8 +98,8 @@ FORMAT DE SORTIE : réponds UNIQUEMENT avec un objet JSON valide respectant exac
   ],
   "ameliorations": [ { "titre": "…", "detail": "conseil concret et actionnable (avec exemple si utile)" } ],
   "a_revoir": [ { "notion": "…", "priorite": "haute | moyenne | basse", "pourquoi": "…", "ressources": "pistes : chapitre du cours, exercice type, documentation officielle…" } ],
-  "correction_modele": "correction complète et rédigée en Markdown de tout l'exercice",
-  "mots_cles": ["5 à 12 mots-clés pour retrouver cette correction (notions, langage, matière)"]
+  "mots_cles": ["5 à 12 mots-clés pour retrouver cette correction (notions, langage, matière)"]${withTests ? `,
+  "tests": [ { "question": "numéro", "but": "ce que vérifie le test", "langage": "python | javascript | typescript | sql | java | c | cpp | php", "code": "programme complet", "entree": "", "fichiers": {}, "sortie_attendue": "…" } ]` : ''}
 }`;
 }
 
@@ -188,7 +192,7 @@ function normalizeResult(raw, gradeMax = 20) {
       pourquoi: str(a.pourquoi),
       ressources: str(a.ressources)
     })),
-    correction_modele: str(r.correction_modele),
+    correction_modele: r.correction_modele == null || r.correction_modele === '' ? undefined : str(r.correction_modele),
     mots_cles: arr(r.mots_cles).map(str).slice(0, 15),
     executions: arr(r.executions)
   };
@@ -280,6 +284,15 @@ async function mapLimit(items, limit, fn) {
  * ctx = { ai, audioAi, models: { main, fallbacks, vision, audio }, s, progress, signal, notes, ocr }
  */
 async function readImage(ctx, j) {
+  // Image déjà lue (pré-lecture à l'import, ou nouvelle correction) : résultat en cache
+  if (ctx.visionCache && ctx.models.vision) {
+    const key = ctx.visionCache.key(j.part.base64, ctx.models.vision);
+    return ctx.visionCache.run(key, () => readImageNow(ctx, j));
+  }
+  return readImageNow(ctx, j);
+}
+
+async function readImageNow(ctx, j) {
   if (ctx.models.vision) {
     try {
       const r = await ctx.ai.chat({
@@ -300,6 +313,20 @@ async function readImage(ctx, j) {
   throw new Error('aucun lecteur d\'image disponible');
 }
 
+/** Pré-lecture des images dès l'import (en arrière-plan) : la correction trouvera les transcriptions en cache. */
+async function prereadImages(ctx, files) {
+  const jobs = [];
+  for (const f of files) for (const p of f.parts || []) if (p.type === 'image' && p.base64) jobs.push({ file: f.name, part: p });
+  let n = 0;
+  await mapLimit(jobs, ctx.s.visionParallel || 4, async (j) => {
+    try {
+      await readImage(ctx, j);
+      n++;
+    } catch { /* sera retenté pendant la correction */ }
+  });
+  return n;
+}
+
 async function buildSources(files, ctx) {
   const jobs = [];
   for (const f of files) for (const p of f.parts) jobs.push({ file: f.name, role: f.role || 'auto', part: p });
@@ -307,7 +334,7 @@ async function buildSources(files, ctx) {
   const audios = jobs.filter((j) => j.part.type === 'audio');
   let done = 0;
   if (images.length) ctx.progress({ step: 'vision', message: `Lecture de ${images.length} image(s) avec ${ctx.models.vision || 'l\'OCR local'}…`, done, total: images.length });
-  await mapLimit(images, 2, async (j) => {
+  await mapLimit(images, ctx.s.visionParallel || 4, async (j) => {
     try {
       const r = await readImage(ctx, j);
       j.text = r.text;
@@ -363,31 +390,102 @@ class TooLarge extends AIError {
   }
 }
 
+/** Effort de raisonnement selon le mode choisi (Rapide / Équilibré / Approfondi). */
+const SPEED = { rapide: 'low', equilibre: 'medium', approfondi: 'high' };
+function effortFor(ctx) {
+  return SPEED[ctx.s.speedMode] || ctx.s.reasoningEffort || 'medium';
+}
+
+/** Chronomètre d'une étape (affiché à la fin de la correction). */
+async function timed(ctx, etape, fn) {
+  const t = Date.now();
+  try {
+    return await fn();
+  } finally {
+    (ctx.timings ||= []).push({ etape, ms: Date.now() - t });
+  }
+}
+
+// ---------- Lecture du résultat au fur et à mesure (flux) ----------
+
+/** Extrait d'un JSON en cours d'écriture : titre, note et questions déjà complètes. */
+function extractPartial(text) {
+  const out = { questions: [] };
+  const t = text.match(/"titre"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (t) out.titre = t[1].replace(/\\"/g, '"');
+  const n = text.match(/"note"\s*:\s*\{\s*"obtenue"\s*:\s*([\d.]+)\s*,\s*"sur"\s*:\s*([\d.]+)/);
+  if (n) out.note = { obtenue: Number(n[1]), sur: Number(n[2]) };
+  const qi = text.search(/"questions"\s*:\s*\[/);
+  if (qi >= 0) {
+    let i = text.indexOf('[', qi) + 1;
+    let depth = 0;
+    let start = -1;
+    let inStr = false;
+    for (; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (c === '\\') i++;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (c === '}') {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          try {
+            const q = JSON.parse(text.slice(start, i + 1));
+            out.questions.push({ numero: str(q.numero), intitule: str(q.intitule), statut: str(q.statut), points_obtenus: num(q.points_obtenus), points_max: num(q.points_max) });
+          } catch { /* objet incomplet */ }
+          start = -1;
+        }
+      } else if (c === ']' && depth === 0) break;
+    }
+  }
+  return out;
+}
+
+function partialReporter(ctx, base = {}) {
+  let last = 0;
+  return (delta, acc) => {
+    const now = Date.now();
+    if (now - last < 350) return;
+    last = now;
+    const p = extractPartial(acc);
+    ctx.progress({ step: 'partial', message: 'Correction en cours…', partial: { ...base, ...p, questions: [...(base.questions || []), ...p.questions] } });
+  };
+}
+
 /**
- * Appel au modèle principal avec :
+ * Appel au modèle avec :
+ *  - « tier » : 'main' (notation, grand modèle) ou 'fast' (tâches secondaires, modèle rapide) ;
  *  - sortie limitée au maximum autorisé par le modèle (appris automatiquement) ;
  *  - attente automatique quand le quota de jetons par minute est atteint ;
  *  - bascule sur les modèles de secours en cas de modèle indisponible ;
- *  - signal « trop gros » (TooLarge) si sizeSensitive : l'appelant découpe alors le travail.
+ *  - signal « trop gros » (TooLarge) si sizeSensitive : l'appelant découpe alors le travail ;
+ *  - onDelta : texte reçu au fur et à mesure (affichage progressif).
  */
-async function chatWithFallback(ctx, { system, user, json = true, wantOut = 6000, step = 'correction', label = 'Correction', sizeSensitive = false, effort }) {
-  const models = [ctx.models.main, ...(ctx.models.fallbacks || [])].filter(Boolean);
+async function chatWithFallback(ctx, { system, user, json = true, wantOut = 6000, step = 'correction', label = 'Correction', sizeSensitive = false, effort, tier = 'main', onDelta }) {
+  const models = [...new Set([tier === 'fast' ? ctx.models.fast : null, ctx.models.main, ...(ctx.models.fallbacks || [])].filter(Boolean))];
   let lastErr;
   for (const [mi, model] of models.entries()) {
     let boost = 1;
     let parseFails = 0;
+    const primary = mi === 0 || (tier === 'fast' && model === ctx.models.main);
     for (let attempt = 0; attempt < 5; attempt++) {
       const b = budgetFor(ctx, model, system, wantOut * boost);
       if (est(user) > b.input) {
         // Le modèle principal est trop petit pour cette requête : on découpe plutôt que de dégrader
-        if (sizeSensitive && mi === 0) throw new TooLarge(`Entrée estimée à ${est(user)} jetons pour ${b.input} disponibles.`);
+        if (sizeSensitive && primary) throw new TooLarge(`Entrée estimée à ${est(user)} jetons pour ${b.input} disponibles.`);
         if (sizeSensitive) break;
       }
       ctx.progress({ step, message: `${label} avec ${model}${attempt ? ' (nouvel essai)' : ''}…` });
       try {
         const r = await ctx.ai.chat({
           model, system, messages: [{ role: 'user', content: user }], json, maxTokens: b.out,
-          effort: effort || ctx.s.reasoningEffort, signal: ctx.signal,
+          effort: effort || effortFor(ctx), signal: ctx.signal, onDelta,
           onWait: (ms) => ctx.progress({ step, message: `Pause de ${Math.ceil(ms / 1000)} s (limite de jetons par minute de ton offre)…` })
         });
         if (r.finishReason === 'length') {
@@ -402,7 +500,7 @@ async function chatWithFallback(ctx, { system, user, json = true, wantOut = 6000
           }
         }
         const parsed = json ? parseJsonLoose(r.content) : r.content;
-        if (mi > 0) ctx.notes.push(`Le modèle principal n'a pas pu être utilisé ; ${label.toLowerCase()} réalisée avec ${model}.`);
+        if (mi > 0 && model !== ctx.models.main) ctx.notes.push(`Le modèle principal n'a pas pu être utilisé ; ${label.toLowerCase()} réalisée avec ${model}.`);
         return { parsed, model: r.model || model };
       } catch (err) {
         lastErr = err;
@@ -412,7 +510,7 @@ async function chatWithFallback(ctx, { system, user, json = true, wantOut = 6000
           if (isSizeError(err)) {
             // Les limites réelles viennent d'être apprises (message d'erreur / en-têtes) : on recalcule le budget
             const nb = budgetFor(ctx, model, system, wantOut * boost);
-            if (est(user) > nb.input && sizeSensitive && mi === 0) throw new TooLarge(err.message);
+            if (est(user) > nb.input && sizeSensitive && primary) throw new TooLarge(err.message);
             if (nb.out < b.out && est(user) <= nb.input && attempt < 3) continue; // même modèle, sortie réduite
             break; // limite inconnue ou modèle trop petit : modèle suivant
           }
@@ -428,98 +526,201 @@ async function chatWithFallback(ctx, { system, user, json = true, wantOut = 6000
   throw new Error(`${label} impossible : ${lastErr?.message || 'erreur inconnue'}.`);
 }
 
+/** Nombre d'appels simultanés possibles sans dépasser le quota de jetons par minute. */
+function parallelism(ctx, model, tokensPerCall) {
+  const { tpm } = limitsFor(ctx, model);
+  if (!Number.isFinite(tpm)) return 4;
+  return Math.max(1, Math.min(4, Math.floor((tpm * 0.9) / Math.max(1, tokensPerCall))));
+}
+
+// ================================================================ Exécution du code (tests intégrés à la correction)
+
 const CODE_LANGS = /```(python|py|javascript|js|sql|java|c|cpp|c\+\+|php|typescript|ts|plsql|mysql)\b/i;
 
 function hasRunnableCode(sources) {
   return sources.some((s) => CODE_LANGS.test(s.text) || /\b(def |public class |#include|SELECT .+ FROM|CREATE TABLE|function\s*\w*\s*\(|console\.log|System\.out)/i.test(s.text));
 }
 
-const TESTS_SYSTEM = `Tu prépares des tests d'exécution pour vérifier le code écrit par un étudiant en informatique.
-Langages exécutables : python (3.14, bibliothèque standard, numpy/pandas si besoin), javascript et typescript (Node.js), sql, java (un fichier, plusieurs classes possibles), c, cpp, php.
-Pour chaque réponse de code de l'ÉTUDIANT (pas l'énoncé), écris un programme COMPLET et AUTONOME qui reprend son code TEL QUEL — sans corriger ses erreurs NI changer sa syntaxe — et ajoute des appels de test qui AFFICHENT les résultats (cas normaux et cas limites demandés par l'énoncé).
-SQL : écris le script dans le dialecte de l'étudiant (Oracle, MySQL, PostgreSQL, SQL Server… l'application convertit automatiquement : ne modifie JAMAIS sa syntaxe). Commence par créer les tables et insérer un jeu de données cohérent avec l'énoncé, assez riche pour distinguer une requête juste d'une fausse (cas avec NULL, doublons, lignes qui ne doivent pas sortir), puis ses requêtes telles quelles.
-Si le programme lit au clavier (input, Scanner, scanf, cin, readline…), fournis TOUTES les valeurs nécessaires dans "entree" (une par ligne). S'il lit des fichiers, fournis-les dans "fichiers" ({"nom.txt": "contenu"}).
-Si la réponse est un fragment (une fonction seule), ajoute le code d'appel nécessaire autour, sans toucher au fragment.
-Indique la sortie attendue si le code était correct. Au maximum 4 tests, les plus révélateurs. Si rien n'est exécutable, renvoie une liste vide.
-Réponds UNIQUEMENT en JSON : {"executions":[{"but":"ce que le test vérifie","langage":"python|javascript|typescript|sql|java|c|cpp|php","code":"programme complet","entree":"texte envoyé sur l'entrée standard","fichiers":{},"sortie_attendue":"…"}]}`;
+/** Consignes d'écriture des tests, intégrées à l'appel de correction (plus d'appel séparé). */
+const TESTS_SPEC = `TESTS D'EXÉCUTION (champ "tests") : si la copie contient du code exécutable (python, javascript, typescript, sql, java, c, cpp, php), propose au plus 4 tests, les plus révélateurs. Chaque test est un programme COMPLET qui reprend le code de l'étudiant TEL QUEL (sans corriger ses erreurs ni changer sa syntaxe ou son dialecte SQL — l'application convertit Oracle/MySQL/SQL Server) et ajoute des appels qui AFFICHENT les résultats. SQL : crée les tables et un jeu de données révélateur (NULL, doublons, lignes qui ne doivent pas sortir), puis ses requêtes telles quelles. Fournis "entree" si le programme lit au clavier et "fichiers" ({"nom.txt":"contenu"}) s'il lit des fichiers. "sortie_attendue" = ce qu'afficherait un code juste ; "question" = numéro concerné. Ta notation sera confrontée aux résultats réels. Pas de code : "tests": [].`;
 
-/** Demande à l'IA un plan de tests pour un bloc de documents, puis exécute réellement le code de l'étudiant. */
-async function verifyByExecution(ctx, docsText, consigne, runCode, { sizeSensitive = false } = {}) {
-  if (!ctx.s.executeCode || !runCode || !hasRunnableCode([{ text: docsText }])) return [];
-  // Code lu sur une image : une faute de syntaxe peut venir de la transcription
-  const fromImage = /nature: transcription automatique d'image/.test(docsText) && !/nature: (texte extrait|page de PDF)[\s\S]*?(```|def |class |SELECT)/.test(docsText);
-  try {
-    const { parsed } = await chatWithFallback(ctx, { system: TESTS_SYSTEM, user: `${consigne ? `Indications : ${consigne}\n\n` : ''}${docsText}`, wantOut: 3500, step: 'tests', label: 'Préparation des tests', sizeSensitive, effort: 'low' });
-    const plan = arr(parsed.executions).filter((e) => e && e.code).slice(0, 4);
-    const out = [];
-    for (const [i, e] of plan.entries()) {
-      ctx.progress({ step: 'tests', message: `Exécution du test ${i + 1}/${plan.length} (${e.langage})…` });
-      const files = e.fichiers && typeof e.fichiers === 'object' && !Array.isArray(e.fichiers) ? Object.fromEntries(Object.entries(e.fichiers).map(([k, v]) => [String(k).replace(/[\\/]+/g, '_'), str(v)])) : {};
-      const r = await runCode({ language: e.langage, code: str(e.code), stdin: str(e.entree), timeoutMs: 10000, files });
-      out.push({
-        but: str(e.but), langage: r.language, code: str(e.code), entree: str(e.entree), sortie_attendue: str(e.sortie_attendue),
-        stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode, timedOut: !!r.timedOut, unavailable: !!r.unavailable, ok: r.ok, durationMs: r.durationMs,
-        // Erreur due à l'outil (dialecte, entrée non fournie, module absent…) : jamais comptée
-        internal: !!r.internal, category: r.category || null, explication: r.explication || null, fromImage
-      });
+async function runTests(ctx, tests, runCode, fromImage = false) {
+  const plan = arr(tests).filter((e) => e && e.code).slice(0, 4);
+  const out = [];
+  for (const [i, e] of plan.entries()) {
+    ctx.progress({ step: 'tests', message: `Exécution du test ${i + 1}/${plan.length} (${e.langage})…` });
+    const files = e.fichiers && typeof e.fichiers === 'object' && !Array.isArray(e.fichiers) ? Object.fromEntries(Object.entries(e.fichiers).map(([k, v]) => [String(k).replace(/[\\/]+/g, '_'), str(v)])) : {};
+    const r = await runCode({ language: e.langage, code: str(e.code), stdin: str(e.entree), timeoutMs: 10000, files });
+    out.push({
+      question: str(e.question), but: str(e.but), langage: r.language, code: str(e.code), entree: str(e.entree), sortie_attendue: str(e.sortie_attendue),
+      stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode, timedOut: !!r.timedOut, unavailable: !!r.unavailable, ok: r.ok, durationMs: r.durationMs,
+      // Erreur due à l'outil (dialecte, entrée non fournie, module absent…) : jamais comptée
+      internal: !!r.internal, category: r.category || null, explication: r.explication || null, fromImage
+    });
+  }
+  return out;
+}
+
+/** La sortie obtenue contient-elle les valeurs attendues (ordre, espaces, casse et mise en forme ignorés) ? */
+function outputsMatch(expected, got) {
+  const toks = (s) => String(s || '').toLowerCase().replace(/\(\d+ ligne\(s\)\)/g, ' ').replace(/[|\-–—=+*_:;,()[\]{}"'`]/g, ' ').split(/\s+/).filter((x) => x && x !== 'null');
+  const exp = toks(expected);
+  if (!exp.length) return true;
+  const have = new Map();
+  for (const t of toks(got)) have.set(t, (have.get(t) || 0) + 1);
+  let missing = 0;
+  for (const t of exp) {
+    const n = have.get(t) || 0;
+    if (n) have.set(t, n - 1);
+    else missing++;
+  }
+  return missing <= Math.floor(exp.length * 0.1);
+}
+
+/** Tests qui contredisent la notation provisoire (question jugée juste mais test raté, ou l'inverse). */
+function contradictions(result, executions) {
+  const out = [];
+  for (const e of executions) {
+    if (e.internal || e.unavailable) continue;
+    const passed = e.ok && outputsMatch(e.sortie_attendue, e.stdout);
+    const q = result.questions.find((x) => e.question && normQ(x.numero) === normQ(e.question));
+    if (!q) {
+      if (!passed) out.push({ e, q: null });
+      continue;
     }
-    return out;
+    if ((!passed && q.statut === 'correct') || (passed && ['incorrect', 'non_traite'].includes(q.statut))) out.push({ e, q });
+  }
+  return out;
+}
+
+const REVISE_SYSTEM = (s) => `Tu es le correcteur d'un devoir d'informatique (${s.level}). Tu as déjà noté certaines questions ; le code de l'étudiant a ensuite été RÉELLEMENT exécuté. Confronte ta notation aux résultats.
+Corrige statut, points, commentaire et fautes UNIQUEMENT si les résultats montrent que ta correction était fausse. Attention : un résultat marqué « LIMITE DE L'OUTIL » ne compte pas ; un test peut être mal écrit (données, sortie attendue) : dans ce cas garde ta notation.
+${FAIRNESS_RULES}
+Réponds UNIQUEMENT en JSON : {"questions":[{"numero":"…","intitule":"…","statut":"correct | partiel | incorrect | non_traite","points_obtenus":0,"points_max":0,"commentaire":"…"}],"fautes":[{"question":"…","gravite":"…","categorie":"…","notion":"…","description":"…","extrait":"…","correction":"…"}]}`;
+
+/** Remplace les questions corrigées (et leurs fautes) puis recalcule la note à partir des points. */
+function applyRevision(result, revised, gradeMax) {
+  const qs = arr(revised.questions);
+  if (!qs.length) return result;
+  const keys = new Set(qs.map((q) => normQ(q.numero)));
+  const raw = {
+    ...result,
+    note: undefined,
+    score_pourcentage: undefined,
+    questions: [...result.questions.map((q) => qs.find((n) => normQ(n.numero) === normQ(q.numero)) || q), ...qs.filter((n) => !result.questions.some((q) => normQ(q.numero) === normQ(n.numero)))],
+    fautes: [...result.fautes.filter((f) => !keys.has(normQ(f.question))), ...arr(revised.fautes)]
+  };
+  const next = normalizeResult(raw, gradeMax);
+  next.executions = result.executions;
+  return next;
+}
+
+/** Si un test contredit la notation : un petit appel ciblé révise uniquement les questions concernées. */
+async function reviseWithTests(ctx, result, executions) {
+  const issues = contradictions(result, executions);
+  if (!issues.length) return result;
+  const targets = issues.some((x) => !x.q) ? result.questions : [...new Set(issues.map((x) => x.q))];
+  const keys = new Set(targets.map((q) => normQ(q.numero)));
+  const user = `NOTATION PROVISOIRE :\n${JSON.stringify({ questions: targets, fautes: result.fautes.filter((f) => keys.has(normQ(f.question))) }, null, 1)}${executionsBlock(executions)}\n\nRéponds uniquement avec l'objet JSON demandé (questions révisées et leurs fautes).`;
+  try {
+    const { parsed } = await chatWithFallback(ctx, { system: REVISE_SYSTEM(ctx.s), user, wantOut: 3000, step: 'revision', label: 'Vérification de la note avec les tests' });
+    ctx.notes.push(`Les résultats d'exécution ont été confrontés à la notation (${issues.length} point(s) vérifié(s)).`);
+    return applyRevision(result, parsed, ctx.s.gradeMax);
   } catch (err) {
-    if (err instanceof TooLarge) throw err;
     if (err.code === 'aborted' || err.status === 401) throw err;
-    ctx.notes.push(`Vérification par exécution impossible : ${err.message}`);
-    return [];
+    return result;
   }
 }
+
+// ================================================================ Rattrapage des questions « non traitées »
+
+const RESCUE_SYSTEM = (s) => `Tu es le correcteur d'un devoir d'informatique (${s.level}). Les questions ci-dessous ont été marquées « non traitée » lors d'une première lecture, peut-être à tort.
+Cherche ATTENTIVEMENT la réponse de l'étudiant à chacune dans TOUTE sa copie : la numérotation peut différer de l'énoncé (« Q3 », « 3) », « Exercice 2 – 3 », « II.1 »…), l'ordre peut être différent, la question peut être recopiée avant la réponse, plusieurs questions peuvent être traitées ensemble, ou la réponse peut ne pas être numérotée.
+Si tu trouves la réponse, corrige la question normalement (statut, points selon le barème, commentaire, fautes). Si elle est vraiment absente, garde "non_traite" avec 0 point.
+${FAIRNESS_RULES}
+Réponds UNIQUEMENT en JSON : {"questions":[{"numero":"…","intitule":"…","statut":"correct | partiel | incorrect | non_traite","points_obtenus":0,"points_max":0,"commentaire":"…"}],"fautes":[{"question":"…","gravite":"mineure | moyenne | majeure","categorie":"…","notion":"…","description":"…","extrait":"…","correction":"…"}]}`;
+
+async function rescueUnanswered(ctx, result, answerText, enonceText = '') {
+  const missing = result.questions.filter((q) => q.statut === 'non_traite');
+  const total = result.questions.length;
+  if (!missing.length || String(answerText).replace(/\s/g, '').length < 150) return result;
+  if (missing.length < 2 && missing.length / Math.max(1, total) < 0.25) return result;
+  const system = RESCUE_SYSTEM(ctx.s);
+  const b = budgetFor(ctx, ctx.models.main, system, 4000);
+  const qList = missing.map((q) => `- ${q.numero} : ${q.intitule} (sur ${q.points_max} pt)`).join('\n');
+  const room = b.input - est(qList) - 300;
+  const en = enonceText ? sliceText(enonceText, Math.floor(room * 0.3)) : '';
+  const ans = sliceText(answerText, room - est(en));
+  const user = `QUESTIONS MARQUÉES « NON TRAITÉE » :\n${qList}\n\n${en ? `ÉNONCÉ :\n${en}\n\n` : ''}COPIE DE L'ÉTUDIANT (en entier) :\n${ans}\n\nRéponds uniquement avec l'objet JSON demandé.`;
+  try {
+    const { parsed } = await timed(ctx, 'Recherche des réponses manquantes', () => chatWithFallback(ctx, { system, user, wantOut: 4000, step: 'rescue', label: `Recherche des réponses de ${missing.length} question(s) non trouvée(s)` }));
+    const found = arr(parsed.questions).filter((q) => q.statut && q.statut !== 'non_traite').length;
+    if (found) ctx.notes.push(`${found} réponse(s) d'abord non trouvée(s) ont été retrouvées dans ta copie et corrigées.`);
+    return applyRevision(result, parsed, ctx.s.gradeMax);
+  } catch (err) {
+    if (err.code === 'aborted' || err.status === 401) throw err;
+    return result;
+  }
+}
+
+const isEnonceSource = (s, result) => s.role === 'enonce' || s.kind === 'generated' || (result?.identification?.enonce || []).includes(s.file);
 
 // ================================================================ Correction en un seul appel
 
 async function correctSingle(ctx, sources, consigne, runCode) {
   const { sources: fitted, truncated } = fitSources(sources, ctx.s.maxInputChars);
   const docs = documentsBlock(fitted);
-  const system = buildSystemPrompt(ctx.s);
-  const user = (ex) => `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}Voici les ${fitted.length} document(s) fournis. Identifie l'énoncé, les réponses et l'éventuel barème, puis corrige.\n\n${docs}${executionsBlock(ex)}\n\nRéponds uniquement avec l'objet JSON demandé.`;
-  // Vérification préalable : si tout ne tient pas dans un appel, on passe directement au mode découpé
-  if (est(user([])) > budgetFor(ctx, ctx.models.main, system, 6000).input) throw new TooLarge();
-  const executions = await verifyByExecution(ctx, docs, consigne, runCode, { sizeSensitive: true });
-  const { parsed, model } = await chatWithFallback(ctx, { system, user: user(executions), sizeSensitive: true });
+  const withTests = !!(ctx.s.executeCode && runCode && hasRunnableCode(fitted));
+  const system = buildSystemPrompt(ctx.s, { withTests });
+  const user = `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}Voici les ${fitted.length} document(s) fournis. Identifie l'énoncé, les réponses et l'éventuel barème, puis corrige.\n\n${docs}\n\nRéponds uniquement avec l'objet JSON demandé.`;
+  // Si tout ne tient pas dans un appel, on passe directement au mode découpé
+  if (est(user) > budgetFor(ctx, ctx.models.main, system, 6000).input) throw new TooLarge();
+  const { parsed, model } = await timed(ctx, 'Correction', () => chatWithFallback(ctx, { system, user, sizeSensitive: true, onDelta: partialReporter(ctx) }));
   if (truncated) ctx.notes.push(`Les documents dépassent ${ctx.s.maxInputChars.toLocaleString('fr-FR')} caractères : la fin a été tronquée (réglable dans les Réglages).`);
-  const result = normalizeResult(parsed, ctx.s.gradeMax);
-  result.executions = executions;
+  let result = normalizeResult(parsed, ctx.s.gradeMax);
+  ctx.progress({ step: 'partial', message: 'Note provisoire', partial: { titre: result.titre, note: result.note, questions: result.questions } });
+  // Exécution réelle des tests proposés, puis révision ciblée seulement en cas de contradiction
+  if (withTests && arr(parsed.tests).length) {
+    const fromImage = fitted.some((s) => s.kind === 'image') && !fitted.some((s) => s.kind !== 'image' && CODE_LANGS.test(s.text));
+    const executions = await timed(ctx, 'Exécution du code', () => runTests(ctx, parsed.tests, runCode, fromImage));
+    result.executions = executions;
+    result = await timed(ctx, 'Vérification par les tests', () => reviseWithTests(ctx, result, executions));
+  }
+  // Questions « non traitées » : nouvelle recherche dans toute la copie (numérotation différente…)
+  const answers = fitted.filter((s) => !isEnonceSource(s, result));
+  result = await rescueUnanswered(ctx, result, documentsBlock(answers), documentsBlock(fitted.filter((s) => isEnonceSource(s, result))));
   return { result, model, mode: 'single' };
 }
 
 // ================================================================ Correction découpée (gros devoirs, petites limites)
-//  1. INDEXATION : chaque document est lu morceau par morceau (un appel à la fois) ; l'IA renvoie seulement
-//     des plages de lignes (énoncé / réponse / barème + numéro de question) — le texte reste intact localement.
-//  2. REGROUPEMENT : énoncé, barème et réponse de chaque question sont réunis.
-//  3. CORRECTION PAR LOTS : chaque lot de questions est corrigé par un appel indépendant (sous-tâche) qui tient
-//     dans les limites du modèle, avec exécution du code du lot.
-//  4. SYNTHÈSE : un dernier appel, très court, produit l'appréciation globale ; la note est recalculée localement.
+//  1. DÉCOUPAGE : chaque document est découpé par question (repérage local de « Exercice 2 », « Q3 », « 1.a) »…,
+//     sinon par l'IA qui renvoie seulement des plages de lignes — le texte reste intact localement).
+//  2. RATTACHEMENT : chaque réponse est rattachée à sa question, même si la numérotation diffère.
+//  3. CORRECTION PAR LOTS (en parallèle si l'offre le permet), avec tests intégrés.
+//  4. SYNTHÈSE courte ; la note est recalculée localement ; rattrapage des questions non trouvées.
 
 const INDEX_SYSTEM = `Tu prépares la correction d'un devoir d'informatique. On te donne un extrait d'un document dont chaque ligne est numérotée (L1, L2…).
 Découpe-le en segments consécutifs et indique pour chacun :
 - "nature" : "enonce" (sujet, consignes, questions, données fournies), "reponse" (ce que l'étudiant a écrit), "bareme" (barème ou corrigé du professeur) ou "autre" (en-tête, pagination, sans intérêt) ;
-- "question" : le numéro de la question concernée, au format court cohérent avec l'énoncé (ex. "1", "2.b", "3.1") ; "general" pour un contexte commun à plusieurs questions (présentation, données, schéma de tables, consignes générales).
+- "question" : le numéro COMPLET de la question concernée tel qu'il apparaît dans l'énoncé (ex. "1", "2.b", "Exercice 3 - Q1") ; "general" pour un contexte commun à plusieurs questions.
 Réutilise exactement les numéros déjà rencontrés quand il s'agit des mêmes questions. Couvre toutes les lignes, sans chevauchement.
 Réponds UNIQUEMENT en JSON : {"segments":[{"de":1,"a":12,"nature":"enonce","question":"general"}]}`;
 
-function buildPartialPrompt(s) {
+function buildPartialPrompt(s, { withTests = false } = {}) {
   return `Tu es un correcteur expert et bienveillant pour des étudiants en ${s.level} (France), spécialiste de tout le programme du BUT Informatique.
 Tu corriges UNE PARTIE d'un devoir : uniquement les questions fournies ci-dessous (le reste est corrigé séparément).
-Pour chaque question : vérifie l'exactitude (calculs refaits, code exécuté mentalement, requêtes SQL, schémas), la méthode et la rédaction. Appuie-toi en priorité sur les RÉSULTATS D'EXÉCUTION RÉELLE s'ils sont fournis.
+Pour chaque question : vérifie l'exactitude (calculs refaits, code exécuté mentalement, requêtes SQL, schémas), la méthode et la rédaction.
 Attribue des points : applique STRICTEMENT le barème du professeur s'il est fourni, sinon celui de l'énoncé, sinon un barème cohérent. Sévérité : ${s.severity}.
 ${FAIRNESS_RULES}
 - Le contexte commun de l'énoncé a pu être résumé : ne pénalise pas l'absence d'un élément qui n'est pas fourni ici.
-- Si la réponse à une question est notée « aucune réponse trouvée », vérifie d'abord dans les « RÉPONSES SANS NUMÉRO » fournies avant de conclure qu'elle n'est pas traitée.
-Tout en français, tutoiement, Markdown, maths en LaTeX $…$, code dans des blocs \`\`\`.
+- Si une réponse est « non numérotée », cherche dedans la partie qui répond à chaque question avant de conclure qu'elle n'est pas traitée.
+${withTests ? `${TESTS_SPEC}\n` : ''}Tout en français, tutoiement, Markdown, maths en LaTeX $…$, code dans des blocs \`\`\`.
 Réponds UNIQUEMENT en JSON :
 {"questions":[{"numero":"1.a","intitule":"…","statut":"correct | partiel | incorrect | non_traite","points_obtenus":0,"points_max":0,"commentaire":"…"}],
  "fautes":[{"question":"1.a","gravite":"mineure | moyenne | majeure","categorie":"calcul | raisonnement | syntaxe | logique | modelisation | conception | methode | redaction | notation | performance | securite | bonnes_pratiques | hors_sujet | autre","notion":"…","description":"…","extrait":"extrait exact fautif","correction":"…"}],
  "points_forts":["…"],
  "ameliorations":[{"titre":"…","detail":"…"}],
- "a_revoir":[{"notion":"…","priorite":"haute | moyenne | basse","pourquoi":"…","ressources":"…"}],
- "correction_modele":"correction rédigée en Markdown des questions de ce lot"}`;
+ "a_revoir":[{"notion":"…","priorite":"haute | moyenne | basse","pourquoi":"…","ressources":"…"}]${withTests ? ',\n "tests":[{"question":"…","but":"…","langage":"…","code":"…","entree":"","fichiers":{},"sortie_attendue":"…"}]' : ''}}`;
 }
 
 const SYNTH_SYSTEM = `Tu rédiges la synthèse finale d'une correction de devoir d'informatique (BUT Informatique), à partir des résultats déjà établis question par question.
@@ -531,10 +732,29 @@ Réponds UNIQUEMENT en JSON :
  "remarques_identification":"comment l'énoncé, les réponses et le barème ont été repérés","mots_cles":["5 à 12 mots-clés"]}`;
 
 function normQ(q) {
-  let s = String(q ?? '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
-  if (!s || /^(general|commun|contexte|global|intro|presentation|tout|toutes|all)/.test(s)) return 'general';
-  s = s.replace(/\b(exercice|exo|ex|question|questions|partie|part|q)\b\.?/g, ' ').replace(/[()\-–:/\\]+/g, ' ').trim().replace(/\s+/g, '.').replace(/\.+/g, '.').replace(/^\.|\.$/g, '');
-  return s || 'general';
+  return canonQ(q);
+}
+
+const ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10, xi: 11, xii: 12 };
+
+/**
+ * Numéro de question canonique : « Exercice 2 – Question 3.b » -> « 2.3.b », « Q3 » -> « 3 »,
+ * « 3) » -> « 3 », « II.1 » -> « 2.1 », « Partie A, question 1 » -> « a.1 ».
+ */
+function canonQ(label) {
+  const raw = String(label ?? '').trim();
+  let s = raw.normalize('NFD').replace(/[̀-ͯ]/g, '');
+  if (!s || /^(general|g[ée]n[ée]ral|commun|contexte|global|intro|presentation|tout|toutes|all|aucun)/i.test(s)) return 'general';
+  // Chiffres romains (en majuscules dans le texte d'origine, ou après « partie / exercice »)
+  s = s.replace(/\b(?:(partie|exercice|exo|ex|part)\s*)?([IVX]{1,4})\b/g, (m, w, r) => (ROMAN[r.toLowerCase()] && (w || r === r.toUpperCase()) ? `${w || ''} ${ROMAN[r.toLowerCase()]}` : m));
+  s = s.toLowerCase()
+    .replace(/\b([a-z]+)(\d)/g, '$1 $2')
+    .replace(/\b(exercices?|exos?|ex|questions?|qst|q|parties?|part|r[eé]ponses?|rep|reponse|r|item|point|pt|n°|no|num[eé]ro)\b\.?/g, ' ')
+    .replace(/(\d)([a-z])\b/g, '$1.$2')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  const toks = s.split(/\s+/).filter((t) => /^\d+$/.test(t) || /^[a-z]$/.test(t));
+  return toks.length ? toks.map((t) => t.replace(/^0+(?=\d)/, '')).join('.') : 'general';
 }
 
 /** Découpe un texte en morceaux d'au plus maxTokens (par lignes ; les lignes trop longues sont coupées). */
@@ -564,81 +784,217 @@ function splitIntoChunks(text, maxTokens) {
 
 const sliceText = (text, maxTokens) => (est(text) <= maxTokens ? text : `${text.slice(0, Math.floor(maxTokens * 3.2))}\n[… suite tronquée pour tenir dans les limites du modèle …]`);
 
-async function indexDocuments(ctx, sources) {
-  const units = new Map(); // clé -> { label, enonce: [], reponse: [], bareme: [] }
-  const general = { enonce: [], reponse: [], bareme: [] };
-  const seen = { enonce: new Set(), reponse: new Set(), bareme: new Set() };
-  const known = [];
-  const indexBudget = budgetFor(ctx, ctx.models.main, INDEX_SYSTEM, 2000);
-  let chunkTokens = Math.min(6000, indexBudget.input - 300);
-  for (const [si, src] of sources.entries()) {
-    let chunks = splitIntoChunks(src.text, chunkTokens);
-    for (let ci = 0; ci < chunks.length; ci++) {
-      const lines = chunks[ci];
-      const user = `Fichier : ${src.file} — ${src.label}\nRôle indiqué par l'étudiant : ${ROLE_LABEL[src.role] || ROLE_LABEL.auto}\nNuméros de questions déjà rencontrés : ${known.slice(-60).join(', ') || 'aucun'}\n\n${lines.map((l, i) => `L${i + 1}| ${l}`).join('\n')}`;
-      let segments;
-      try {
-        ({ parsed: { segments } = {} } = await chatWithFallback(ctx, { system: INDEX_SYSTEM, user, wantOut: 2000, step: 'index', label: `Lecture de « ${src.label} » (${si + 1}/${sources.length}${chunks.length > 1 ? `, partie ${ci + 1}/${chunks.length}` : ''})`, sizeSensitive: true, effort: 'low' }));
-      } catch (err) {
-        if (err instanceof TooLarge && chunkTokens > 500) {
-          // Morceau encore trop gros pour les limites réelles : on le redécoupe
-          chunkTokens = Math.floor(chunkTokens / 2);
-          const rest = chunks.slice(ci).flat().join('\n');
-          chunks = [...chunks.slice(0, ci), ...splitIntoChunks(rest, chunkTokens)];
-          ci--;
-          continue;
-        }
-        if (err.code === 'aborted' || err.status === 401) throw err;
-        ctx.notes.push(`Découpage automatique impossible pour « ${src.label} » (${err.message}) : document traité d'un bloc.`);
-        segments = [{ de: 1, a: lines.length, nature: src.role === 'auto' ? 'reponse' : src.role, question: 'general' }];
+/** Rôle probable d'un fichier d'après son nom (« reponses.pdf », « sujet_TD3.pdf »…). */
+function roleHint(src) {
+  if (src.role && src.role !== 'auto') return src.role;
+  const n = String(src.file || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  if (/bareme|corrige|correction[_ -]?prof/.test(n)) return 'bareme';
+  if (/repon|copie|rendu|answer|reponse|solution|travail|mes[_ -]|resolution/.test(n)) return 'reponse';
+  if (/sujet|enonce|consigne|questions?[_ .-]|exam|partiel|controle|td\d|tp\d/.test(n)) return 'enonce';
+  return 'auto';
+}
+
+const MARKERS = [
+  { re: /^\s*(?:#+\s*|\*\*)?(?:exercice|exo|ex\.?|partie)\s*(\d+|[IVX]{1,4}|[A-H])\b/i, level: 'ex' },
+  { re: /^\s*(?:#+\s*|\*\*)?(?:question|q|r[ée]ponse|rep\.?)\s*\.?\s*(\d+(?:[.\-]\d+)*(?:\s*[a-h])?)\b/i, level: 'q' },
+  { re: /^\s*(?:#+\s*|\*\*)?(\d{1,2}(?:\.\d{1,2})*)\s*[).:–-]\s+\S/, level: 'q' },
+  { re: /^\s*(?:#+\s*|\*\*)?(\d{1,2}\s*[a-h])\s*[).:]\s*/i, level: 'q' },
+  { re: /^\s*([a-h])\s*\)\s+\S/, level: 'sub' }
+];
+
+/**
+ * Découpage LOCAL (sans IA) quand la structure est explicite : « Exercice 2 », « Q3 », « 1) », « 2.b) », « a) »…
+ * Renvoie null si la structure n'est pas assez claire (l'IA prend alors le relais).
+ */
+function segmentLocal(lines, nature) {
+  if (!['enonce', 'reponse', 'bareme'].includes(nature)) return null;
+  const segs = [];
+  let ex = null;
+  let q = null;
+  let inCode = false;
+  let markers = 0;
+  let cur = { de: 1, nature, question: 'general' };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) inCode = !inCode;
+    if (inCode) continue;
+    let label = null;
+    for (const m of MARKERS) {
+      const hit = line.match(m.re);
+      if (!hit) continue;
+      if (m.level === 'ex') {
+        ex = hit[1];
+        q = null;
+        label = `Exercice ${ex}`;
+      } else if (m.level === 'q') {
+        q = hit[1].replace(/\s+/g, '');
+        label = ex && !/[.\-]/.test(q) ? `${ex}.${q}` : q;
+      } else if (m.level === 'sub' && q) {
+        label = `${ex && !/[.\-]/.test(q) ? `${ex}.` : ''}${q}.${hit[1]}`;
       }
-      // Segments -> texte local intact (les lignes non couvertes suivent le segment précédent)
-      const segs = arr(segments).map((g) => ({ de: Math.max(1, Math.floor(num(g.de, 1))), a: Math.min(lines.length, Math.floor(num(g.a, lines.length))), nature: str(g.nature), question: str(g.question) }))
-        .filter((g) => g.a >= g.de).sort((x, y) => x.de - y.de);
-      if (!segs.length) segs.push({ de: 1, a: lines.length, nature: 'reponse', question: 'general' });
-      segs[0].de = 1;
-      for (let k = 0; k < segs.length; k++) segs[k].a = k + 1 < segs.length ? Math.max(segs[k].de, segs[k + 1].de - 1) : lines.length;
-      for (const g of segs) {
-        let nature = ['enonce', 'reponse', 'bareme', 'autre'].includes(g.nature) ? g.nature : 'reponse';
-        if (src.role && src.role !== 'auto' && nature !== 'autre') nature = src.role;
-        // Un long passage classé « autre » dans une copie est gardé comme réponse (évite de perdre du travail)
-        if (nature === 'autre' && (g.a - g.de >= 3) && src.role !== 'enonce') nature = 'reponse';
-        if (nature === 'autre') continue;
-        const text = lines.slice(g.de - 1, g.a).join('\n').trim();
-        if (!text) continue;
-        seen[nature].add(src.file);
-        const key = normQ(g.question);
-        const tagged = `(${src.label})\n${text}`;
-        if (key === 'general') general[nature].push(tagged);
-        else {
-          if (!units.has(key)) {
-            units.set(key, { key, label: g.question.trim() || key, enonce: [], reponse: [], bareme: [] });
-            known.push(g.question.trim() || key);
-          }
-          units.get(key)[nature].push(tagged);
-        }
-      }
+      break;
+    }
+    if (label) {
+      markers++;
+      if (i > 0) segs.push({ ...cur, a: i });
+      cur = { de: i + 1, nature, question: label };
     }
   }
-  return { units: [...units.values()], general, seen };
+  segs.push({ ...cur, a: lines.length });
+  return markers >= 2 ? segs.filter((g) => g.a >= g.de) : null;
+}
+
+async function indexDocuments(ctx, sources) {
+  const units = new Map(); // clé -> { key, label, enonce: [], reponse: [], bareme: [], order }
+  const general = { enonce: [], reponse: [], bareme: [] };
+  const seen = { enonce: new Set(), reponse: new Set(), bareme: new Set() };
+  const indexBudget = budgetFor(ctx, ctx.models.fast || ctx.models.main, INDEX_SYSTEM, 2000);
+  const chunkTokens = Math.max(600, Math.min(6000, indexBudget.input - 300));
+  // Tous les morceaux de tous les documents
+  const jobs = [];
+  for (const [si, src] of sources.entries()) {
+    const chunks = splitIntoChunks(src.text, chunkTokens);
+    chunks.forEach((lines, ci) => jobs.push({ src, si, ci, n: chunks.length, lines }));
+  }
+  let local = 0;
+  const results = new Array(jobs.length);
+  const par = parallelism(ctx, ctx.models.fast || ctx.models.main, chunkTokens + 2500);
+  await mapLimit(jobs, par, async (job, k) => {
+    const hint = roleHint(job.src);
+    // 1. Repérage local, instantané
+    const loc = segmentLocal(job.lines, hint);
+    if (loc) {
+      local++;
+      results[k] = loc;
+      return;
+    }
+    // 2. Sinon, l'IA (modèle rapide) repère les plages de lignes
+    const user = `Fichier : ${job.src.file} — ${job.src.label}\nRôle probable : ${ROLE_LABEL[hint] || ROLE_LABEL.auto}\n\n${job.lines.map((l, i) => `L${i + 1}| ${l}`).join('\n')}`;
+    try {
+      const { parsed } = await chatWithFallback(ctx, { system: INDEX_SYSTEM, user, wantOut: 2000, step: 'index', label: `Repérage des questions dans « ${job.src.label} »${job.n > 1 ? ` (partie ${job.ci + 1}/${job.n})` : ''}`, effort: 'low', tier: 'fast' });
+      results[k] = arr(parsed.segments);
+    } catch (err) {
+      if (err.code === 'aborted' || err.status === 401) throw err;
+      ctx.notes.push(`Repérage automatique impossible pour « ${job.src.label} » (${err.message}) : document traité d'un bloc.`);
+      results[k] = [{ de: 1, a: job.lines.length, nature: hint === 'auto' ? 'reponse' : hint, question: 'general' }];
+    }
+  });
+  if (local) ctx.notes.push(`${local} partie(s) de document découpée(s) instantanément grâce à leur numérotation.`);
+  let order = 0;
+  jobs.forEach((job, k) => {
+    const { src, lines } = job;
+    const hint = roleHint(src);
+    // Segments -> texte local intact (les lignes non couvertes suivent le segment précédent)
+    const segs = arr(results[k]).map((g) => ({ de: Math.max(1, Math.floor(num(g.de, 1))), a: Math.min(lines.length, Math.floor(num(g.a, lines.length))), nature: str(g.nature), question: str(g.question) }))
+      .filter((g) => g.a >= g.de).sort((x, y) => x.de - y.de);
+    if (!segs.length) segs.push({ de: 1, a: lines.length, nature: hint === 'auto' ? 'reponse' : hint, question: 'general' });
+    segs[0].de = 1;
+    for (let i = 0; i < segs.length; i++) segs[i].a = i + 1 < segs.length ? Math.max(segs[i].de, segs[i + 1].de - 1) : lines.length;
+    for (const g of segs) {
+      let nature = ['enonce', 'reponse', 'bareme', 'autre'].includes(g.nature) ? g.nature : 'reponse';
+      if (src.role && src.role !== 'auto' && nature !== 'autre') nature = src.role;
+      // Un long passage classé « autre » dans une copie est gardé comme réponse (évite de perdre du travail)
+      if (nature === 'autre' && (g.a - g.de >= 3) && hint !== 'enonce') nature = 'reponse';
+      if (nature === 'autre') continue;
+      const text = lines.slice(g.de - 1, g.a).join('\n').trim();
+      if (!text) continue;
+      seen[nature].add(src.file);
+      const key = canonQ(g.question);
+      const tagged = `(${src.label})\n${text}`;
+      if (key === 'general') general[nature].push(tagged);
+      else {
+        if (!units.has(key)) units.set(key, { key, label: g.question.trim() || key, enonce: [], reponse: [], bareme: [], order: order++ });
+        units.get(key)[nature].push(tagged);
+      }
+    }
+  });
+  // En-tête d'exercice (« Exercice 2 » suivi de ses questions 2.1, 2.2…) : c'est du contexte, pas une question.
+  // Sinon la réponse « Q1 » serait rattachée à l'en-tête « Exercice 1 » au lieu de la question 1.1.
+  for (const u of [...units.values()]) {
+    const children = [...units.values()].filter((c) => c !== u && c.key.startsWith(`${u.key}.`));
+    if (!children.length) continue;
+    if (u.enonce.length) general.enonce.push(`[Contexte de ${u.label}]\n${u.enonce.join('\n\n')}`);
+    if (u.bareme.length) general.bareme.push(...u.bareme);
+    u.enonce = [];
+    u.bareme = [];
+    if (!u.reponse.length) units.delete(u.key);
+  }
+  return { units: [...units.values()].sort((a, b) => a.order - b.order), general, seen };
+}
+
+const ALIGN_SYSTEM = `Tu rattaches les réponses d'un étudiant aux questions de l'énoncé d'un devoir d'informatique. La numérotation de l'étudiant peut différer (« Q3 » pour « Exercice 1 – Question 3 », ordre différent, sans numéro…).
+Pour chaque réponse, indique la clé de la question à laquelle elle répond (d'après son contenu), ou null si elle ne correspond à aucune.
+Réponds UNIQUEMENT en JSON : {"correspondances":[{"reponse":"R1","question":"clé de la question ou null"}]}`;
+
+/**
+ * Rattache chaque réponse à sa question, même si la numérotation de la copie diffère de celle de l'énoncé.
+ *  1. même numéro canonique ; 2. fin de numéro unique (« 3 » -> « 1.3 ») ; 3. même nombre et même ordre ;
+ *  4. sinon l'IA rattache d'après le contenu.
+ */
+async function alignUnits(ctx, units) {
+  const questions = units.filter((u) => u.enonce.length);
+  const orphans = units.filter((u) => !u.enonce.length && u.reponse.length);
+  if (!questions.length || !orphans.length) return units;
+  const free = () => questions.filter((q) => !q.reponse.length);
+  const merge = (a, q) => {
+    q.reponse.push(...a.reponse);
+    q.bareme.push(...a.bareme);
+    a.merged = true;
+  };
+  // 2. Fin de numéro unique, dans l'ordre
+  let lastIdx = -1;
+  for (const a of orphans) {
+    const cands = free().filter((q) => q.key === a.key || q.key.endsWith(`.${a.key}`) || a.key.endsWith(`.${q.key}`));
+    if (!cands.length) continue;
+    const next = cands.find((q) => questions.indexOf(q) > lastIdx) || cands[0];
+    if (cands.length === 1 || next) {
+      merge(a, next);
+      lastIdx = questions.indexOf(next);
+    }
+  }
+  let rest = orphans.filter((a) => !a.merged);
+  // 3. Même nombre de réponses restantes que de questions sans réponse : appariement dans l'ordre
+  if (rest.length && rest.length === free().length) {
+    const qs = free();
+    rest.forEach((a, i) => merge(a, qs[i]));
+    rest = [];
+  }
+  // 4. L'IA rattache d'après le contenu
+  if (rest.length && free().length) {
+    const qs = free();
+    const user = `QUESTIONS DE L'ÉNONCÉ :\n${qs.map((q) => `[${q.key}] ${q.label} : ${q.enonce.join(' ').replace(/\s+/g, ' ').slice(0, 220)}`).join('\n')}\n\nRÉPONSES DE L'ÉTUDIANT :\n${rest.map((a, i) => `[R${i + 1}] (numérotée « ${a.label} ») ${a.reponse.join(' ').replace(/\s+/g, ' ').slice(0, 260)}`).join('\n')}`;
+    try {
+      const { parsed } = await chatWithFallback(ctx, { system: ALIGN_SYSTEM, user: sliceText(user, budgetFor(ctx, ctx.models.main, ALIGN_SYSTEM, 1500).input - 50), wantOut: 1500, step: 'index', label: 'Rattachement des réponses aux questions', effort: 'low' });
+      for (const c of arr(parsed.correspondances)) {
+        const a = rest[Number(String(c.reponse).replace(/\D/g, '')) - 1];
+        const q = qs.find((x) => x.key === canonQ(c.question) || x.key === String(c.question));
+        if (a && q && !a.merged) merge(a, q);
+      }
+    } catch (err) {
+      if (err.code === 'aborted' || err.status === 401) throw err;
+    }
+  }
+  const merged = orphans.filter((a) => a.merged).length;
+  if (merged) ctx.notes.push(`${merged} réponse(s) numérotée(s) différemment de l'énoncé ont été rattachées à la bonne question.`);
+  return units.filter((u) => !u.merged);
 }
 
 /** Contexte commun trop long : condensé (données et schémas conservés). */
 async function condense(ctx, text, maxTokens) {
   if (est(text) <= maxTokens) return text;
   const system = 'Tu condenses le contexte commun d\'un énoncé d\'informatique pour un correcteur. Conserve INTÉGRALEMENT les données chiffrées, schémas de tables, signatures de fonctions, contraintes et barème ; supprime les répétitions et le texte décoratif. Réponds en texte brut (Markdown autorisé).';
-  const parts = splitIntoChunks(text, Math.max(800, budgetFor(ctx, ctx.models.main, system, 1500).input - 200));
+  const parts = splitIntoChunks(text, Math.max(800, budgetFor(ctx, ctx.models.fast || ctx.models.main, system, 1500).input - 200));
   const per = Math.max(200, Math.floor(maxTokens / parts.length));
-  const out = [];
-  for (const [i, p] of parts.entries()) {
+  const out = new Array(parts.length);
+  await mapLimit(parts, parallelism(ctx, ctx.models.fast || ctx.models.main, 4000), async (p, i) => {
     try {
-      const { parsed } = await chatWithFallback(ctx, { system, user: `Condense en ${per * 3} caractères maximum :\n\n${p.join('\n')}`, json: false, wantOut: Math.min(1500, per + 200), step: 'index', label: `Résumé du contexte (${i + 1}/${parts.length})`, effort: 'low' });
-      out.push(parsed);
+      const { parsed } = await chatWithFallback(ctx, { system, user: `Condense en ${per * 3} caractères maximum :\n\n${p.join('\n')}`, json: false, wantOut: Math.min(1500, per + 200), step: 'index', label: `Résumé du contexte (${i + 1}/${parts.length})`, effort: 'low', tier: 'fast' });
+      out[i] = parsed;
     } catch (err) {
       if (err.code === 'aborted' || err.status === 401) throw err;
-      out.push(p.join('\n'));
+      out[i] = p.join('\n');
     }
-  }
+  });
   return sliceText(out.join('\n\n'), maxTokens);
 }
 
@@ -656,24 +1012,27 @@ function unitText(u, maxTokens) {
 }
 
 async function correctChunked(ctx, sources, consigne, runCode) {
-  ctx.progress({ step: 'index', message: 'Documents volumineux : correction découpée, un document puis un lot de questions à la fois…' });
+  ctx.progress({ step: 'index', message: 'Documents volumineux : correction découpée par questions…' });
   const { sources: capped, truncated } = fitSources(sources, ctx.s.maxInputChars);
   if (truncated) ctx.notes.push(`Les documents dépassent ${ctx.s.maxInputChars.toLocaleString('fr-FR')} caractères : la fin a été ignorée (réglable dans les Réglages).`);
-  const { units, general, seen } = await indexDocuments(ctx, capped);
-  const partialSystem = buildPartialPrompt(ctx.s);
+  const indexed = await timed(ctx, 'Repérage des questions', () => indexDocuments(ctx, capped));
+  const { general, seen } = indexed;
+  const units = await timed(ctx, 'Rattachement des réponses', () => alignUnits(ctx, indexed.units));
+  const withTests = !!(ctx.s.executeCode && runCode && hasRunnableCode(capped));
+  const partialSystem = buildPartialPrompt(ctx.s, { withTests });
   const b = budgetFor(ctx, ctx.models.main, partialSystem, 6000);
   // Contexte commun (présentation, données…) : au plus 30 % du budget de chaque lot
   const sharedRaw = [...general.enonce, ...general.bareme.map((t) => `[BARÈME / CORRIGÉ]\n${t}`)].join('\n\n');
-  const shared = sharedRaw ? await condense(ctx, sharedRaw, Math.floor(b.input * 0.3)) : '';
-  // Réponses sans numéro : jointes aux questions dont la réponse n'a pas été repérée (au lieu de les compter « non traitées »)
+  const shared = sharedRaw ? await timed(ctx, 'Résumé du contexte', () => condense(ctx, sharedRaw, Math.floor(b.input * 0.3))) : '';
+  // Réponses sans numéro : jointes aux questions dont la réponse n'a pas été repérée
   const looseAnswers = general.reponse.length ? sliceText(general.reponse.join('\n\n'), Math.floor(b.input * 0.25)) : '';
-  if (looseAnswers) for (const u of units) if (!u.reponse.length) u.reponse.push(`[Réponse non numérotée — à chercher parmi les RÉPONSES SANS NUMÉRO ci-dessous]\n${looseAnswers}`);
-  if (general.reponse.length && units.every((u) => u.reponse.length && !u.reponse[0].startsWith('[Réponse non numérotée'))) units.push({ key: 'general', label: 'Réponses sans numéro', enonce: [], bareme: [], reponse: general.reponse });
+  if (looseAnswers) for (const u of units) if (!u.reponse.length) u.reponse.push(`[Réponse non numérotée — à chercher dans ce texte]\n${looseAnswers}`);
+  if (general.reponse.length && !units.some((u) => u.reponse.some((r) => r.startsWith('[Réponse non numérotée')))) units.push({ key: 'general', label: 'Réponses sans numéro', enonce: [], bareme: [], reponse: general.reponse });
   if (!units.length) throw new Error('Aucune question ni réponse n\'a pu être repérée dans les documents.');
   const head = `${consigne ? `INDICATIONS DE L'ÉTUDIANT : ${consigne}\n\n` : ''}${shared ? `CONTEXTE COMMUN DE L'ÉNONCÉ :\n${shared}\n\n` : ''}QUESTIONS À CORRIGER DANS CE LOT :\n\n`;
   const room = Math.max(600, b.input - est(head) - 400);
   // Lots de questions qui tiennent dans le budget
-  const batches = [];
+  let batches = [];
   let cur = [];
   let size = 0;
   for (const u of units) {
@@ -688,51 +1047,49 @@ async function correctChunked(ctx, sources, consigne, runCode) {
   }
   if (cur.length) batches.push(cur);
 
-  const merged = { questions: [], fautes: [], points_forts: [], ameliorations: [], a_revoir: [], modele: [], executions: [] };
+  const done = [];
   let model = ctx.models.main;
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
+  // Correction d'un lot (re-découpé si les limites réelles sont dépassées)
+  const runBatch = async (batch, i, n) => {
     const labels = batch.map((x) => x.u.label).join(', ');
-    const docs = batch.map((x) => x.t).join('\n\n');
-    let executions = [];
+    const user = `${head}${batch.map((x) => x.t).join('\n\n')}\n\nRéponds uniquement avec l'objet JSON demandé.`;
     try {
-      executions = await verifyByExecution(ctx, `${head}${docs}`, '', runCode, { sizeSensitive: true });
-    } catch (err) {
-      if (!(err instanceof TooLarge)) throw err;
-    }
-    const user = `${head}${docs}${executionsBlock(executions)}\n\nRéponds uniquement avec l'objet JSON demandé.`;
-    let parsed;
-    try {
-      ({ parsed, model } = await chatWithFallback(ctx, { system: partialSystem, user, step: 'correction', label: `Correction des questions ${labels} (lot ${i + 1}/${batches.length})`, sizeSensitive: true }));
+      const r = await chatWithFallback(ctx, { system: partialSystem, user, step: 'correction', label: `Correction des questions ${labels} (lot ${i + 1}/${n})`, sizeSensitive: true });
+      model = r.model;
+      return [r.parsed];
     } catch (err) {
       if (err instanceof TooLarge && batch.length > 1) {
-        // Lot encore trop gros pour les limites réelles : on le coupe en deux
         const half = Math.ceil(batch.length / 2);
-        batches.splice(i, 1, batch.slice(0, half), batch.slice(half));
-        i--;
-        continue;
+        return [...(await runBatch(batch.slice(0, half), i, n)), ...(await runBatch(batch.slice(half), i, n))];
       }
-      if (err instanceof TooLarge) {
-        // Une seule question trop grosse : on la raccourcit fortement
+      if (err instanceof TooLarge && !batch[0].shrunk) {
+        batch[0].shrunk = true;
         batch[0].t = unitText(batch[0].u, Math.floor(room / 2));
-        if (room > 1200 && !batch[0].shrunk) {
-          batch[0].shrunk = true;
-          i--;
-          continue;
-        }
+        return runBatch(batch, i, n);
       }
       throw err;
     }
-    merged.questions.push(...arr(parsed.questions));
-    merged.fautes.push(...arr(parsed.fautes));
-    merged.points_forts.push(...arr(parsed.points_forts));
-    merged.ameliorations.push(...arr(parsed.ameliorations));
-    merged.a_revoir.push(...arr(parsed.a_revoir));
-    if (parsed.correction_modele) merged.modele.push(str(parsed.correction_modele));
-    merged.executions.push(...executions);
+  };
+  const perCall = est(head) + room + b.out;
+  const outputs = new Array(batches.length);
+  await timed(ctx, 'Correction des lots', () => mapLimit(batches, parallelism(ctx, ctx.models.main, perCall), async (batch, i) => {
+    outputs[i] = await runBatch(batch, i, batches.length);
+    for (const p of outputs[i]) done.push(...arr(p.questions));
+    ctx.progress({ step: 'partial', message: `Lot ${done.length ? i + 1 : 0}/${batches.length} corrigé`, partial: { questions: done.map((q) => ({ numero: str(q.numero), intitule: str(q.intitule), statut: str(q.statut), points_obtenus: num(q.points_obtenus), points_max: num(q.points_max) })) } });
+  }));
+  const merged = { questions: [], fautes: [], points_forts: [], ameliorations: [], a_revoir: [], tests: [] };
+  for (const parts of outputs) {
+    for (const parsed of parts || []) {
+      merged.questions.push(...arr(parsed.questions));
+      merged.fautes.push(...arr(parsed.fautes));
+      merged.points_forts.push(...arr(parsed.points_forts));
+      merged.ameliorations.push(...arr(parsed.ameliorations));
+      merged.a_revoir.push(...arr(parsed.a_revoir));
+      merged.tests.push(...arr(parsed.tests));
+    }
   }
 
-  // Synthèse (entrée compacte : résultats déjà établis)
+  // Synthèse (entrée compacte : résultats déjà établis), modèle rapide
   const pts = (q) => `${num(q.points_obtenus)}/${num(q.points_max)}`;
   const synthUser = sliceText(`Fichiers : ${capped.map((s) => s.file).filter((v, i, a) => a.indexOf(v) === i).join(', ')}
 Énoncé repéré dans : ${[...seen.enonce].join(', ') || 'aucun fichier (questions déduites des réponses)'}
@@ -747,14 +1104,20 @@ ${merged.fautes.map((f) => `- (${str(f.gravite)}) ${str(f.notion || f.categorie)
 
 POINTS FORTS : ${merged.points_forts.map(str).join(' ; ').slice(0, 1500)}
 CONSEILS : ${merged.ameliorations.map((a) => str(a.titre || a)).join(' ; ').slice(0, 1500)}
-NOTIONS À REVOIR : ${merged.a_revoir.map((a) => `${str(a.notion || a)} (${str(a.priorite)})`).join(' ; ').slice(0, 1500)}`, Math.max(1500, budgetFor(ctx, ctx.models.main, SYNTH_SYSTEM, 2500).input - 100));
+NOTIONS À REVOIR : ${merged.a_revoir.map((a) => `${str(a.notion || a)} (${str(a.priorite)})`).join(' ; ').slice(0, 1500)}`, Math.max(1500, budgetFor(ctx, ctx.models.fast || ctx.models.main, SYNTH_SYSTEM, 2500).input - 100));
+  // Synthèse et exécution des tests en même temps
   let synth = {};
-  try {
-    ({ parsed: synth } = await chatWithFallback(ctx, { system: SYNTH_SYSTEM, user: synthUser, wantOut: 2500, step: 'synthese', label: 'Synthèse finale' }));
-  } catch (err) {
-    if (err.code === 'aborted' || err.status === 401) throw err;
-    ctx.notes.push(`Synthèse finale incomplète (${err.message}).`);
-  }
+  const [, executions] = await Promise.all([
+    timed(ctx, 'Synthèse', async () => {
+      try {
+        ({ parsed: synth } = await chatWithFallback(ctx, { system: SYNTH_SYSTEM, user: synthUser, wantOut: 2500, step: 'synthese', label: 'Synthèse finale', effort: 'low', tier: 'fast' }));
+      } catch (err) {
+        if (err.code === 'aborted' || err.status === 401) throw err;
+        ctx.notes.push(`Synthèse finale incomplète (${err.message}).`);
+      }
+    }),
+    withTests && merged.tests.length ? timed(ctx, 'Exécution du code', () => runTests(ctx, merged.tests, runCode)) : Promise.resolve([])
+  ]);
   const raw = {
     titre: synth.titre,
     matiere: synth.matiere,
@@ -769,12 +1132,16 @@ NOTIONS À REVOIR : ${merged.a_revoir.map((a) => `${str(a.notion || a)} (${str(a
     fautes: merged.fautes,
     ameliorations: arr(synth.ameliorations).length ? synth.ameliorations : merged.ameliorations.slice(0, 8),
     a_revoir: arr(synth.a_revoir).length ? synth.a_revoir : merged.a_revoir.slice(0, 10),
-    correction_modele: merged.modele.join('\n\n---\n\n'),
     mots_cles: synth.mots_cles
   };
-  const result = normalizeResult(raw, ctx.s.gradeMax);
-  result.executions = merged.executions;
-  ctx.notes.push(`Documents volumineux : correction réalisée en ${batches.length} lot(s) successifs pour respecter les limites de ${ctx.models.main}.`);
+  let result = normalizeResult(raw, ctx.s.gradeMax);
+  result.executions = executions;
+  if (executions.length) result = await timed(ctx, 'Vérification par les tests', () => reviseWithTests(ctx, result, executions));
+  // Questions encore « non traitées » : nouvelle recherche dans la copie entière
+  const answerText = capped.filter((s) => roleHint(s) !== 'enonce' && seen.reponse.has(s.file)).map((s) => s.text).join('\n\n') || [...units.flatMap((u) => u.reponse), ...general.reponse].join('\n\n');
+  result = await rescueUnanswered(ctx, result, answerText, [...general.enonce].join('\n\n'));
+  ctx.notes.push(`Documents volumineux : correction réalisée en ${batches.length} lot(s) pour respecter les limites de ${ctx.models.main}.`);
+  batches = null;
   return { result, model, mode: 'chunked' };
 }
 
@@ -783,7 +1150,7 @@ function dedupeQuestions(questions) {
   const rank = { correct: 3, partiel: 2, incorrect: 1, non_traite: 0 };
   const byKey = new Map();
   for (const q of arr(questions)) {
-    const key = normQ(q.numero) || `#${byKey.size}`;
+    const key = canonQ(q.numero) || `#${byKey.size}`;
     const prev = byKey.get(key);
     // On garde la version où la réponse a été trouvée (pas « non traitée ») et la mieux notée
     if (!prev || (rank[q.statut] ?? 1) > (rank[prev.statut] ?? 1) || ((rank[q.statut] ?? 1) === (rank[prev.statut] ?? 1) && num(q.points_obtenus) > num(prev.points_obtenus))) byKey.set(key, q);
@@ -801,16 +1168,49 @@ async function runCorrection(ctx, sources, consigne, runCode) {
   }
 }
 
-async function correct(ctx, { files, consigne, runCode }) {
-  const sources = await buildSources(files, ctx);
-  if (!sources.length) throw new Error("Aucun contenu exploitable n'a pu être extrait des fichiers fournis.");
-  const out = await runCorrection(ctx, sources, consigne, runCode);
+function finish(ctx, out, sources, t0) {
+  const total = Date.now() - t0;
+  out.result.timings = { total, etapes: ctx.timings || [] };
   return { ...out, sources, warnings: ctx.notes };
 }
 
-async function recorrect(ctx, { sources, consigne, runCode }) {
+async function correct(ctx, { files, consigne, runCode }) {
+  const t0 = Date.now();
+  ctx.timings = ctx.timings || [];
+  const sources = await timed(ctx, 'Lecture des images et de l\'audio', () => buildSources(files, ctx));
+  if (!sources.length) throw new Error("Aucun contenu exploitable n'a pu être extrait des fichiers fournis.");
   const out = await runCorrection(ctx, sources, consigne, runCode);
-  return { ...out, sources, warnings: ctx.notes };
+  return finish(ctx, out, sources, ctx.startedAt || t0);
+}
+
+async function recorrect(ctx, { sources, consigne, runCode }) {
+  const t0 = Date.now();
+  ctx.timings = ctx.timings || [];
+  const out = await runCorrection(ctx, sources, consigne, runCode);
+  return finish(ctx, out, sources, ctx.startedAt || t0);
+}
+
+// ---------------------------------------------------------------- Correction modèle (générée après l'affichage de la note)
+const MODEL_ANSWER_SYSTEM = (s) => `Tu es enseignant en ${s.level}. Rédige la CORRECTION MODÈLE complète des questions demandées, comme un corrigé distribué aux étudiants : réponse juste et rédigée, étapes de calcul, code commenté, requêtes SQL, schémas décrits, avec de courtes explications.
+Respecte le langage et le dialecte utilisés dans l'énoncé (ex. Oracle si l'énoncé est en Oracle). Markdown, maths en LaTeX $…$, code dans des blocs \`\`\`langage. Pas de JSON : uniquement le Markdown du corrigé, avec un titre « ## Question … » par question.`;
+
+async function generateModelAnswer(ctx, result, sources) {
+  const system = MODEL_ANSWER_SYSTEM(ctx.s);
+  const enonce = (sources || []).filter((s) => isEnonceSource(s, result));
+  const qs = result.questions.length ? result.questions : [{ numero: '', intitule: result.titre }];
+  // Groupes de questions pour rester dans la sortie maximale du modèle
+  const groups = [];
+  for (let i = 0; i < qs.length; i += 6) groups.push(qs.slice(i, i + 6));
+  const b = budgetFor(ctx, ctx.models.main, system, 6000);
+  const out = new Array(groups.length);
+  await mapLimit(groups, parallelism(ctx, ctx.models.main, b.input + b.out), async (g, i) => {
+    const list = g.map((q) => `- ${q.numero} : ${q.intitule}`).join('\n');
+    const room = b.input - est(list) - 200;
+    const en = enonce.length ? documentsBlock(fitSources(enonce, Math.floor(room * 3.2)).sources) : `Titre : ${result.titre} (${result.matiere})`;
+    const { parsed } = await chatWithFallback(ctx, { system, user: `QUESTIONS À CORRIGER :\n${list}\n\nÉNONCÉ :\n${en}`, json: false, wantOut: 6000, step: 'modele', label: `Rédaction de la correction modèle${groups.length > 1 ? ` (${i + 1}/${groups.length})` : ''}`, effort: 'low' });
+    out[i] = String(parsed).trim();
+  });
+  return out.join('\n\n');
 }
 
 // ---------------------------------------------------------------- Fiches de révision
@@ -824,7 +1224,7 @@ Fautes :
 ${result.fautes.map((f) => `- [${f.gravite}] ${f.notion || f.categorie} : ${f.description} → ${f.correction}`).join('\n') || '(aucune)'}
 Notions à revoir :
 ${result.a_revoir.map((a) => `- ${a.notion} : ${a.pourquoi}`).join('\n') || '(aucune)'}`;
-  const { parsed } = await chatWithFallback(ctx, { system, user: sliceText(user, budgetFor(ctx, ctx.models.main, system, 3000).input - 50), wantOut: 3000, step: 'flashcards', label: 'Création des fiches', effort: 'low' });
+  const { parsed } = await chatWithFallback(ctx, { system, user: sliceText(user, budgetFor(ctx, ctx.models.main, system, 3000).input - 50), wantOut: 3000, step: 'flashcards', label: 'Création des fiches', effort: 'low', tier: 'fast' });
   return arr(parsed.fiches).map((f) => ({ front: str(f.recto), back: str(f.verso), notion: str(f.notion) })).filter((f) => f.front && f.back);
 }
 
@@ -930,5 +1330,6 @@ async function locateFaultsOnImage(ctx, base64, fautes) {
 module.exports = {
   correct, recorrect, generateFlashcards, generateExercise, normalizeResult, buildName, fitSources, parseJsonLoose,
   buildSystemPrompt, hasRunnableCode, chatWithFallback, chatAbout, locateFaultsOnImage, budgetFor, sliceText, splitIntoChunks, normQ, TooLarge,
+  generateModelAnswer, prereadImages, canonQ, segmentLocal, alignUnits, rescueUnanswered, extractPartial, outputsMatch, roleHint, readImageNow,
   DEFAULTS, EXERCISE_TYPES, TYPE_LABELS, VISION_PROMPT
 };

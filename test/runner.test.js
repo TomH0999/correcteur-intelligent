@@ -18,3 +18,18 @@ test('exécution Python, JavaScript, SQL et coupure des boucles infinies', async
   const cobol = await runner.runCode({ language: 'cobol', code: '' });
   assert.ok(cobol.unavailable);
 });
+
+test('exécutions simultanées : sorties non mélangées, programme suivant relancé après une boucle infinie', async (t) => {
+  t.after(() => runner.shutdown());
+  await runner.warmup();
+  const res = await Promise.all([1, 2, 3].map((i) => runner.runCode({ language: 'python', code: `print("run ${i}")` })));
+  assert.deepEqual(res.map((r) => r.stdout.trim()), ['run 1', 'run 2', 'run 3']);
+  const t0 = Date.now();
+  const [loop, next] = await Promise.all([
+    runner.runCode({ language: 'python', code: 'while True: pass', timeoutMs: 1500 }),
+    runner.runCode({ language: 'python', code: 'print("suivant")' })
+  ]);
+  assert.ok(loop.timedOut);
+  assert.equal(next.stdout.trim(), 'suivant');
+  assert.ok(Date.now() - t0 < 20000, 'moteur déjà chargé : pas de délai de chargement');
+});

@@ -29,12 +29,9 @@ async function loadModels(root, providerId) {
         <div class="field"><label class="label">Modèle de correction</label>${modelSelect('s-model', d.correction, s.correctionModel)}<span class="xs dim">Auto : ${esc(d.correction[0] || '—')}</span></div>
         <div class="field"><label class="label">Modèle de vision (images, manuscrits, schémas)</label>${modelSelect('s-vision', visionList.map((m) => m), s.visionModel)}<span class="xs dim">${Object.entries(tested).map(([m, ok]) => `${ok ? '✅' : '❌'} ${esc(m)}`).join(' · ') || 'Les modèles sont testés avec une petite image avant d\'être utilisés.'}</span></div>
         <div class="field"><label class="label">Transcription audio</label>${d.audio.length ? modelSelect('s-audio', d.audio, s.audioModel) : '<input disabled value="Non proposée par ce fournisseur (Groq ou OpenAI utilisés si une clé existe)" />'}</div>
-        <div class="field"><label class="label">Effort de raisonnement</label>
-          <select id="s-effort"><option value="low">Faible (rapide)</option><option value="medium">Moyen</option><option value="high">Élevé (plus précis)</option></select></div>
       </div>
       <p class="xs dim" style="margin:10px 0 0"><i class="fa-solid fa-circle-check" style="color:var(--emerald)"></i> ${d.all.length} modèles lus en direct sur ton compte ${esc(prov.label)}. Si un modèle disparaît, l'application en choisit un autre automatiquement.</p>
       <div class="row" style="margin-top:12px"><button class="btn sm" id="s-resolve"><i class="fa-solid fa-stethoscope"></i>Vérifier la configuration</button><span class="small" id="s-resolve-out"></span></div>`;
-    $('#s-effort', root).value = s.reasoningEffort;
     $('#s-resolve', root).onclick = async (e) => {
       const btn = e.currentTarget;
       btn.disabled = true;
@@ -102,6 +99,11 @@ async function render(root) {
       <div class="grid2">
         <div class="field"><label class="label">Niveau</label><select id="s-level">${['BUT Informatique — 1re année', 'BUT Informatique — 2e année', 'BUT Informatique — 3e année', 'Licence informatique', 'BTS SIO', 'Lycée — spécialité NSI'].map((l) => `<option ${l === s.level ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
         <div class="field"><label class="label">Sévérité</label><select id="s-sev"><option value="indulgente">Indulgente</option><option value="normale">Normale</option><option value="stricte (comme un examen)">Stricte (comme un examen)</option></select></div>
+        <div class="field"><label class="label">Vitesse de correction</label><select id="s-speed">
+          <option value="rapide">Rapide — raisonnement court (≈ 30 s)</option>
+          <option value="equilibre">Équilibré (recommandé)</option>
+          <option value="approfondi">Approfondi — raisonnement poussé, plus lent</option></select>
+          <span class="xs dim">Les tâches secondaires (repérage, synthèse, fiches) utilisent toujours un modèle rapide.</span></div>
         <div class="field"><label class="label">Barème (note sur)</label><input id="s-grade" type="number" min="1" max="1000" value="${s.gradeMax}" /></div>
         <div class="field"><label class="label">Analyse des PDF</label><select id="s-pdf">
           <option value="auto">Auto : texte + image des pages scannées, manuscrites ou avec figures</option>
@@ -109,7 +111,8 @@ async function render(root) {
           <option value="text">Texte seulement (le plus rapide)</option></select></div>
         <div class="field"><label class="label">Taille max. analysée (caractères) — au-delà des limites du modèle, la correction est découpée automatiquement</label><input id="s-max" type="number" min="4000" step="1000" value="${s.maxInputChars}" /></div>
       </div>
-      <label class="check" style="margin-top:12px"><input type="checkbox" id="s-exec" ${s.executeCode ? 'checked' : ''} /><span>Exécuter mon code pour vérifier les réponses<small>Python, JavaScript et SQL intégrés ; Java, C, C++, PHP si installés sur le PC. Ajoute un appel à l'IA par correction.</small></span></label>
+      <label class="check" style="margin-top:12px"><input type="checkbox" id="s-exec" ${s.executeCode ? 'checked' : ''} /><span>Exécuter mon code pour vérifier les réponses<small>Python, JavaScript et SQL intégrés ; Java, C, C++, PHP si installés sur le PC. Les tests sont écrits pendant la correction, sans appel supplémentaire.</small></span></label>
+      <label class="check"><input type="checkbox" id="s-preread" ${s.preread !== false ? 'checked' : ''} /><span>Lire les images dès leur ajout<small>Les photos et scans sont transcrits pendant que tu ajoutes tes fichiers : la correction démarre ensuite immédiatement.</small></span></label>
       <label class="check"><input type="checkbox" id="s-cards" ${s.autoFlashcards ? 'checked' : ''} /><span>Créer automatiquement des fiches de révision après chaque correction<small>À partir des fautes et des notions à revoir.</small></span></label>
       <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn primary" id="s-save"><i class="fa-solid fa-floppy-disk"></i>Enregistrer</button></div>
     </div>
@@ -164,6 +167,7 @@ async function render(root) {
     </div>`;
   $('#s-sev', root).value = s.severity;
   $('#s-pdf', root).value = s.pdfMode;
+  $('#s-speed', root).value = s.speedMode || 'equilibre';
   bind(root, s, prov);
   if (selectedProvider === s.provider) loadModels(root, s.provider);
 }
@@ -215,9 +219,11 @@ function bind(root, s, prov) {
       pdfMode: $('#s-pdf', root).value,
       maxInputChars: Number($('#s-max', root).value),
       executeCode: $('#s-exec', root).checked,
-      autoFlashcards: $('#s-cards', root).checked
+      autoFlashcards: $('#s-cards', root).checked,
+      speedMode: $('#s-speed', root).value,
+      preread: $('#s-preread', root).checked
     };
-    if ($('#s-model', root)) Object.assign(patch, { correctionModel: $('#s-model', root).value, visionModel: $('#s-vision', root).value, reasoningEffort: $('#s-effort', root).value });
+    if ($('#s-model', root)) Object.assign(patch, { correctionModel: $('#s-model', root).value, visionModel: $('#s-vision', root).value });
     if ($('#s-audio', root)) patch.audioModel = $('#s-audio', root).value;
     state.settings = await api.saveSettings(patch);
     toast('Réglages enregistrés.', 'ok');

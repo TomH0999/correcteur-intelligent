@@ -50,15 +50,13 @@ function fakeGroq(log) {
       if (body.model !== 'qwen/qwen3.8-27b') return json(400, { error: { message: 'messages[0].content must be a string', code: 'invalid' } });
       return json(200, { choices: [{ message: { content: '[copie manuscrite]\n$f\'(x) = 2x$\n```python\ndef f(x): return 2*x\n```' } }] });
     }
-    if (/tests d'exécution/.test(body.messages[0].content)) {
-      return json(200, { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ executions: [{ but: 'f(3)', langage: 'python', code: 'def f(x): return 2*x\nprint(f(3))', sortie_attendue: '6' }] }) } }] });
-    }
     if (body.model === 'openai/gpt-oss-120b') return json(413, { error: { message: 'Request too large', code: 'rate_limit_exceeded' } });
     const user = body.messages[1].content;
     assert.match(user, /f'\(x\) = 2x/);
-    assert.match(user, /RÉSULTATS D'EXÉCUTION RÉELLE/);
-    assert.match(user, /Sortie obtenue :\n6/);
-    return json(200, { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ titre: 'Dérivées', type_exercice: 'maths', note: { obtenue: 18, sur: 20 }, fautes: [{ gravite: 'mineure', description: 'notation', notion: 'dérivée' }] }) } }] });
+    // Les tests d'exécution sont demandés DANS l'appel de correction (plus d'appel séparé)
+    assert.match(body.messages[0].content, /TESTS D'EXÉCUTION/);
+    assert.doesNotMatch(body.messages[0].content, /correction_modele/);
+    return json(200, { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ titre: 'Dérivées', type_exercice: 'maths', note: { obtenue: 18, sur: 20 }, questions: [{ numero: '1', intitule: 'f', statut: 'correct', points_obtenus: 18, points_max: 20 }], fautes: [{ gravite: 'mineure', description: 'notation', notion: 'dérivée' }], tests: [{ question: '1', but: 'f(3)', langage: 'python', code: 'def f(x): return 2*x\nprint(f(3))', sortie_attendue: '6' }] }) } }] });
   };
 }
 
@@ -87,6 +85,9 @@ test('pipeline complet : modèles détectés en direct, vision testée, exécuti
   assert.equal(out.model, 'qwen/qwen3-32b');
   assert.equal(out.result.executions[0].stdout.trim(), '6');
   assert.ok(out.warnings.some((w) => /modèle principal/.test(w)));
+  // Test conforme à la notation : aucun appel de révision
+  assert.ok(!log.some((l) => /révis|Confronte/.test(l.system)));
+  assert.ok(out.result.timings.total >= 0);
 });
 
 test('aucun modèle de vision : OCR local signalé', async () => {
@@ -160,4 +161,143 @@ test('gros devoir + petit modèle (sortie max 4096, 8000 jetons/min) : correctio
   assert.ok(calls.filter((c) => c.startsWith('lot')).length >= 2, calls.join(' '));
   assert.equal(book.limits('groq', 'small-model').maxOut, 4096);
   assert.equal(book.limits('groq', 'small-model').tpm, 8000);
+});
+
+// ------------------------------------------------------------ Rattachement des réponses aux questions
+const C = require('../src/main/corrector');
+const ctxOf = (handler, extra = {}) => ({
+  ai: { chat: async (req) => ({ content: JSON.stringify(handler(req)), finishReason: 'stop', model: req.model }) },
+  models: { main: 'm', fallbacks: [] }, limits: () => ({ context: 128000, maxOut: 8000, tpm: Infinity }),
+  s: { ...C.DEFAULTS }, progress: () => {}, notes: [], ...extra
+});
+
+test('numéros canoniques : Q3, 3), Exercice 2 – Question 3.b, II.1', () => {
+  assert.equal(C.canonQ('Q3'), '3');
+  assert.equal(C.canonQ('3)'), '3');
+  assert.equal(C.canonQ('Exercice 2 – Question 3.b'), '2.3.b');
+  assert.equal(C.canonQ('II.1'), '2.1');
+  assert.equal(C.canonQ('Ex2 Q1'), '2.1');
+  assert.equal(C.canonQ('1a'), '1.a');
+  assert.equal(C.canonQ('général'), 'general');
+});
+
+test('découpage local : énoncé hiérarchique et réponses « Q1 » (blocs de code ignorés)', () => {
+  const en = C.segmentLocal('Exercice 1\nQuestion 1 : f\nQuestion 2 : g\nExercice 2\nQuestion 1 : SQL'.split('\n'), 'enonce');
+  assert.deepEqual(en.map((g) => C.canonQ(g.question)), ['1', '1.1', '1.2', '2', '2.1']);
+  const rep = C.segmentLocal('Q1) def f(): pass\nQ2) x\n```\n1) pas un repère\n```\nQ3) SELECT 1'.split('\n'), 'reponse');
+  assert.deepEqual(rep.map((g) => g.question), ['1', '2', '3']);
+  assert.equal(C.segmentLocal(['texte libre', 'sans numéro'], 'reponse'), null);
+});
+
+test('réponses numérotées autrement que l\'énoncé : rattachées à la bonne question (gros devoir)', async () => {
+  const { AIError } = require('../src/main/providers');
+  const lots = [];
+  const ctx = ctxOf((req) => {
+    const sys = req.system;
+    if (sys.includes('UNE PARTIE')) {
+      const blocks = req.messages[0].content.split('### Question ').slice(1);
+      lots.push(...blocks);
+      return { questions: blocks.map((b) => {
+        const vide = /aucune réponse trouvée/.test(b);
+        return { numero: b.split('\n')[0], intitule: 'q', statut: vide ? 'non_traite' : 'correct', points_obtenus: vide ? 0 : 2, points_max: 2 };
+      }) };
+    }
+    if (sys.includes('synthèse finale')) return { titre: 'Devoir' };
+    // L'appel unique est « trop gros » : on passe en correction découpée
+    throw new AIError('Request too large for model', 413, 'rate_limit_exceeded');
+  });
+  const enonce = ['Exercice 1', 'Question 1 : écrire f', 'Question 2 : écrire g', 'Exercice 2', 'Question 1 : requête A', 'Question 2 : requête B'].join('\n');
+  const copie = ['Q1) def f(): return 1', 'Q2) def g(): return 2', 'Q3) SELECT a FROM t', 'Q4) SELECT b FROM t'].join('\n');
+  const out = await C.recorrect(ctx, { sources: [
+    { file: 'sujet.txt', role: 'auto', label: 'sujet.txt', kind: 'text', text: enonce },
+    { file: 'mes_reponses.txt', role: 'auto', label: 'mes_reponses.txt', kind: 'text', text: copie }
+  ] });
+  assert.equal(out.mode, 'chunked');
+  assert.equal(lots.length, 4, lots.join('\n---\n'));
+  assert.ok(lots.every((l) => !/aucune réponse trouvée/.test(l)), lots.join('\n---\n'));
+  assert.ok(lots.find((l) => l.startsWith('2.1')).includes('SELECT a FROM t'));
+  assert.equal(out.result.note.obtenue, 20);
+});
+
+test('alignement : Q1..Q4 rattachées à 1.1, 1.2, 2.1, 2.2 (et pas aux en-têtes d\'exercice)', async () => {
+  const ctx = ctxOf(() => { throw new Error('aucun appel IA attendu'); });
+  const U = (key, e, r) => ({ key, label: key, enonce: e ? [`énoncé ${key}`] : [], reponse: r ? [`réponse ${key}`] : [], bareme: [] });
+  const units = await C.alignUnits(ctx, [U('1.1', 1, 0), U('1.2', 1, 0), U('2.1', 1, 0), U('2.2', 1, 0), U('1', 0, 1), U('2', 0, 1), U('3', 0, 1), U('4', 0, 1)]);
+  assert.deepEqual(units.map((u) => [u.key, u.reponse[0]]), [['1.1', 'réponse 1'], ['1.2', 'réponse 2'], ['2.1', 'réponse 3'], ['2.2', 'réponse 4']]);
+});
+
+test('alignement par l\'IA quand la numérotation ne suffit pas', async () => {
+  const ctx = ctxOf((req) => {
+    assert.match(req.system, /rattaches les réponses/);
+    return { correspondances: [{ reponse: 'R1', question: 'b' }, { reponse: 'R2', question: 'a' }, { reponse: 'R3', question: null }] };
+  });
+  const U = (key, e, r) => ({ key, label: key, enonce: e ? [`énoncé ${key}`] : [], reponse: r ? [`réponse ${key}`] : [], bareme: [] });
+  const units = await C.alignUnits(ctx, [U('a', 1, 0), U('b', 1, 0), U('x', 0, 1), U('y', 0, 1), U('z', 0, 1)]);
+  assert.equal(units.find((u) => u.key === 'b').reponse[0], 'réponse x');
+  assert.equal(units.find((u) => u.key === 'a').reponse[0], 'réponse y');
+  assert.ok(units.find((u) => u.key === 'z'));
+});
+
+test('rattrapage : questions marquées « non traitée » à tort retrouvées, note recalculée (bug 6/100)', async () => {
+  const seen = [];
+  const ctx = ctxOf((req) => {
+    seen.push(req.system.slice(0, 40));
+    if (/TESTS D'EXÉCUTION|IDENTIFIE/.test(req.system)) {
+      // Première lecture : le modèle n'a pas vu que « Q2 », « Q3 » répondent à « Exercice 1 – 2/3 »
+      return { titre: 'TD', note: { obtenue: 1.2, sur: 20 }, questions: [
+        { numero: '1.1', intitule: 'a', statut: 'correct', points_obtenus: 2, points_max: 2 },
+        { numero: '1.2', intitule: 'b', statut: 'non_traite', points_obtenus: 0, points_max: 4 },
+        { numero: '1.3', intitule: 'c', statut: 'non_traite', points_obtenus: 0, points_max: 4 }
+      ], fautes: [{ question: '1.2', description: 'question non traitée' }] };
+    }
+    assert.match(req.system, /non traitée/);
+    assert.match(req.messages[0].content, /Q2\) SELECT/);
+    return { questions: [
+      { numero: '1.2', intitule: 'b', statut: 'correct', points_obtenus: 4, points_max: 4, commentaire: 'juste' },
+      { numero: '1.3', intitule: 'c', statut: 'partiel', points_obtenus: 3, points_max: 4, commentaire: 'presque' }
+    ], fautes: [{ question: '1.3', gravite: 'mineure', description: 'alias manquant' }] };
+  });
+  const { result } = await C.recorrect(ctx, { sources: [
+    { file: 'sujet.txt', role: 'enonce', label: 'sujet.txt', kind: 'text', text: 'Exercice 1\n1. a\n2. b\n3. c' },
+    { file: 'copie.txt', role: 'reponse', label: 'copie.txt', kind: 'text', text: `Q1) réponse a ${'x'.repeat(60)}\nQ2) SELECT nom FROM client WHERE ville = 'Paris';\nQ3) SELECT COUNT(*) FROM commande GROUP BY client_id;` }
+  ] });
+  assert.equal(seen.length, 2);
+  assert.equal(result.questions.filter((q) => q.statut === 'non_traite').length, 0);
+  assert.equal(result.note.obtenue, 18); // (2+4+3)/10 * 20
+  assert.ok(!result.fautes.some((f) => /non traitée/.test(f.description)));
+  assert.ok(ctx.notes.some((n) => /retrouvées/.test(n)));
+});
+
+test('révision par les tests seulement si un test contredit la notation', async () => {
+  const calls = [];
+  const ctx = ctxOf((req) => {
+    calls.push(req.system.includes('RÉELLEMENT exécuté') ? 'revision' : 'correction');
+    if (req.system.includes('RÉELLEMENT exécuté')) return { questions: [{ numero: '1', intitule: 'f', statut: 'incorrect', points_obtenus: 0, points_max: 2 }], fautes: [{ question: '1', description: 'f(3) renvoie 7' }] };
+    return { titre: 'T', questions: [{ numero: '1', intitule: 'f', statut: 'correct', points_obtenus: 2, points_max: 2 }], fautes: [], tests: [{ question: '1', langage: 'python', code: 'print(7)', sortie_attendue: '6' }] };
+  });
+  const runCode = async () => ({ language: 'python', ok: true, stdout: '7\n', stderr: '', exitCode: 0 });
+  const { result } = await C.recorrect(ctx, { sources: [{ file: 'c.py', role: 'auto', label: 'c.py', kind: 'text', text: '```python\ndef f(x): return x+4\n```' }], runCode });
+  assert.deepEqual(calls, ['correction', 'revision']);
+  assert.equal(result.note.obtenue, 0);
+  assert.equal(result.executions.length, 1);
+});
+
+test('sorties comparées sans tenir compte de la mise en forme', () => {
+  assert.ok(C.outputsMatch('6', '6\n'));
+  assert.ok(C.outputsMatch('Alice | 3\nBob | 5', ' nom  | n\n-----\nBob | 5\nAlice | 3\n(2 ligne(s))'));
+  assert.ok(!C.outputsMatch('6', '7'));
+});
+
+test('résultat partiel lu pendant le flux', () => {
+  const p = C.extractPartial('{"titre":"TD SQL","note":{"obtenue":12,"sur":20},"questions":[{"numero":"1","intitule":"a","statut":"correct","points_obtenus":2,"points_max":2},{"numero":"2","intit');
+  assert.equal(p.titre, 'TD SQL');
+  assert.equal(p.note.obtenue, 12);
+  assert.equal(p.questions.length, 1);
+});
+
+test('rôle deviné d\'après le nom du fichier', () => {
+  assert.equal(C.roleHint({ file: 'Mes_réponses_TD3.pdf' }), 'reponse');
+  assert.equal(C.roleHint({ file: 'sujet-TD3.pdf' }), 'enonce');
+  assert.equal(C.roleHint({ file: 'bareme.pdf' }), 'bareme');
+  assert.equal(C.roleHint({ file: 'scan.jpg', role: 'enonce' }), 'enonce');
 });

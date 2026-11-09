@@ -10,6 +10,19 @@ function ring(score) {
   return `<svg viewBox="0 0 150 150" class="ring"><circle cx="75" cy="75" r="${r}" class="ring-bg"/><circle cx="75" cy="75" r="${r}" class="ring-fg" style="stroke:${scoreColor(score)};stroke-dasharray:${c};stroke-dashoffset:${off}"/></svg>`;
 }
 
+const secs = (ms) => (ms >= 60000 ? `${Math.floor(ms / 60000)} min ${Math.round((ms % 60000) / 1000)} s` : `${Math.max(1, Math.round(ms / 1000))} s`);
+// Correction modèle en cours de rédaction (lancée juste après l'enregistrement)
+const pendingModel = (rec) => Date.now() - new Date(rec.created_at).getTime() < 4 * 60 * 1000;
+let offModel = null;
+
+function showModel(root, text) {
+  const box = $('#modele-box', root);
+  if (!box) return;
+  box.innerHTML = '<div class="md"></div>';
+  setMd($('.md', box), text || '_Correction modèle indisponible pour le moment (réessaie avec « Re-corriger »)._');
+  renderMath(box);
+}
+
 const execTone = (e) => (e.internal && !e.ok ? 'na' : e.unavailable ? 'na' : e.ok ? 'ok' : 'ko');
 
 function render(root, rec) {
@@ -147,7 +160,7 @@ function render(root, rec) {
 
     <section class="card" id="sec-modele">
       <h2><i class="fa-solid fa-graduation-cap"></i>Correction modèle</h2>
-      <div class="md" data-md="modele"></div>
+      <div id="modele-box">${r.correction_modele === undefined ? `<div class="model-wait">${pendingModel(rec) ? '<div class="spinner sm"></div><span>Rédaction de la correction modèle en arrière-plan… (ta note est déjà définitive)</span>' : '<span>Correction modèle non rédigée.</span><button class="btn sm" id="r-model"><i class="fa-solid fa-pen-nib"></i>La rédiger</button>'}</div>` : '<div class="md" data-md="modele"></div>'}</div>
     </section>
 
     <section class="card no-print" id="sec-chat">
@@ -168,6 +181,7 @@ function render(root, rec) {
       <p class="small muted" style="margin-top:-6px">Texte extrait et transcription des images : vérifie qu'un manuscrit a bien été déchiffré.</p>
       ${rec.sources.map((s, i) => `<details class="src"><summary>${esc(s.label)} <span class="xs dim">· ${s.kind === 'image' ? 'image transcrite' : s.kind === 'audio' ? 'audio transcrit' : 'texte'} · ${s.text.length.toLocaleString('fr-FR')} car.</span></summary><div class="md" data-md="src:${i}"></div></details>`).join('')}
       ${rec.consigne ? `<p class="small"><strong>Indications données :</strong> ${esc(rec.consigne)}</p>` : ''}
+      ${r.timings?.total ? `<p class="xs dim timings"><span><i class="fa-solid fa-stopwatch"></i> Correction en ${secs(r.timings.total)}</span>${(r.timings.etapes || []).filter((t) => t.ms >= 500).map((t) => `<span>${esc(t.etape)} : ${secs(t.ms)}</span>`).join('')}</p>` : ''}
       <p class="xs dim">Modèle : ${esc(rec.model || '—')} · ${formatDate(rec.created_at)}${r.mots_cles.length ? ` · Mots-clés : ${r.mots_cles.map(esc).join(', ')}` : ''}</p>
     </section>`;
 
@@ -190,6 +204,27 @@ function render(root, rec) {
 
 function bind(root, rec) {
   const r = rec.result;
+  offModel?.();
+  offModel = null;
+  if (r.correction_modele === undefined) {
+    offModel = api.onModelAnswer((m) => {
+      if (m.id !== rec.id) return;
+      r.correction_modele = m.text;
+      showModel(root, m.text);
+      offModel?.();
+      offModel = null;
+    });
+    $('#r-model', root)?.addEventListener('click', async (e) => {
+      e.currentTarget.disabled = true;
+      $('#modele-box', root).innerHTML = '<div class="model-wait"><div class="spinner sm"></div><span>Rédaction de la correction modèle…</span></div>';
+      try {
+        showModel(root, await api.modelAnswer(rec.id));
+      } catch (err) {
+        toast(err.message, 'error');
+        showModel(root, '');
+      }
+    });
+  }
   $('#r-back', root).onclick = back;
   $('#r-folder', root).onclick = () => chooseFolder(rec);
   $('#r-keep', root)?.addEventListener('click', async () => {
