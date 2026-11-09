@@ -15,6 +15,7 @@ export const TYPE_ICONS = {
   algorithmique: 'fa-diagram-project', web: 'fa-globe', genie_logiciel: 'fa-sitemap', architecture: 'fa-microchip', anglais: 'fa-language',
   communication: 'fa-comments', gestion: 'fa-chart-pie', autre: 'fa-file-lines'
 };
+export const EVAL_LABELS = { controle: 'Contrôle', blanc: 'Contrôle blanc', exo: 'Exercice', test: 'Interro', qcm: 'QCM', tp: 'TP', projet: 'Projet', annale: 'Corrigé' };
 export const STATUT = { correct: ['Correct', 'ok'], partiel: ['Partiel', 'mid'], incorrect: ['Incorrect', 'ko'], non_traite: ['Non traité', 'none'] };
 
 export function tone(score) {
@@ -117,7 +118,7 @@ export function corrItem(c, { selectable = false, selected = false } = {}) {
       <div class="item-icon"><i class="fa-solid ${practice ? 'fa-dumbbell' : TYPE_ICONS[c.exercise_type] || 'fa-file-lines'}"></i></div>
       <div class="item-main">
         <div class="item-name">${esc(c.name)}</div>
-        <div class="item-meta">${formatDate(c.created_at)} · ${esc(TYPE_LABELS[c.exercise_type] || '—')}${c.folder_name ? ` · <i class="fa-solid fa-folder" style="color:var(--amber)"></i> ${esc(c.folder_name)}` : ''} · ${c.files.length} fichier(s)${practice ? ' · <span class="tag brand">entraînement</span>' : ''}${c.counted === 0 ? ' · <span class="tag mid">brouillon</span>' : ''}</div>
+        <div class="item-meta">${formatDate(c.created_at)} · ${esc(TYPE_LABELS[c.exercise_type] || '—')}${c.folder_name ? ` · <i class="fa-solid fa-folder" style="color:var(--amber)"></i> ${esc(c.folder_name)}` : ''} · ${c.files.length ? `${c.files.length} fichier(s)` : ''}${practice ? ' · <span class="tag brand">entraînement</span>' : ''}${c.counted === 0 ? ' · <span class="tag mid">brouillon</span>' : ''}${c.eval_type ? ` · <span class="tag">${esc(EVAL_LABELS[c.eval_type] || c.eval_type)}</span>` : ''}${c.origin === 'claude' ? ' · <span class="tag brand" title="Corrigé dans Claude">Claude</span>' : ''}</div>
       </div>
       <div class="item-score" style="color:${scoreColor(c.score)}">${c.grade != null ? `${fr(c.grade)}<span>/${c.grade_max}</span>` : '—'}</div>
     </div>`;

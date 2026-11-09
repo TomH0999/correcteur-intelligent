@@ -23,6 +23,9 @@ const DEFAULTS = {
   reasoningEffort: 'medium',
   speedMode: 'equilibre',
   preread: true,
+  claudeMode: 'direct',
+  claudeProjectUrl: '',
+  claudeReadable: false,
   executeCode: true,
   autoFlashcards: true
 };

@@ -504,3 +504,32 @@ pre { background: var(--s950); border: 1px solid var(--s800); padding: 10px 12px
 .attempt b { font-family: ui-monospace, Consolas, monospace; font-size: 14px; }
 .attempt:hover { border-color: rgb(59 130 246 / .5); }
 .attempt.current { border-color: var(--brand500); background: rgb(37 99 235 / .12); }
+
+/* ---------- Correction avec Claude ---------- */
+.claude-hero { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; background: linear-gradient(135deg, rgb(37 99 235 / .18), rgb(167 139 250 / .12)); }
+.step-n { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--brand600); color: #fff; font-size: 13px; font-weight: 700; margin-right: 10px; }
+.type-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.type-card { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; text-align: left; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--s700); background: rgb(15 23 42 / .6); color: var(--s200); cursor: pointer; transition: border-color .15s, background .15s; font: inherit; }
+.type-card i { color: var(--brand400); font-size: 18px; margin-bottom: 2px; }
+.type-card b { font-size: 14px; }
+.type-card span { font-size: 12px; color: var(--s400); line-height: 1.35; }
+.type-card:hover { border-color: var(--brand500); }
+.type-card.active { border-color: var(--brand500); background: rgb(37 99 235 / .18); box-shadow: 0 0 0 1px var(--brand500) inset; }
+.howto { margin: 12px 0 8px; padding-left: 20px; color: var(--s300); font-size: 13px; line-height: 1.7; }
+.prompt-pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; max-height: 360px; overflow: auto; background: var(--s950); border: 1px solid var(--s800); border-radius: 8px; padding: 10px 12px; color: var(--s300); }
+.import-preview { margin-top: 10px; min-height: 24px; }
+.import-ok { display: flex; gap: 16px; align-items: center; padding: 10px 14px; border-radius: 10px; background: rgb(16 185 129 / .08); border: 1px solid rgb(16 185 129 / .25); margin-bottom: 6px; }
+.big-grade { font-size: 30px; font-weight: 800; }
+.big-grade span { font-size: 15px; color: var(--s400); font-weight: 600; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: var(--s800); border: 1px solid var(--s700); color: var(--s200); font-size: 12px; cursor: pointer; font-family: inherit; }
+.chip .icon-btn { width: 18px; height: 18px; }
+.claude-next { border-color: rgb(59 130 246 / .35); }
+details.sol { margin-top: 8px; border-left: 3px solid var(--emerald); padding: 4px 0 4px 10px; }
+details.sol summary { cursor: pointer; color: var(--emerald); font-size: 13px; font-weight: 600; }
+.mode-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.mode { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--s700); cursor: pointer; }
+.mode input { display: none; }
+.mode span { font-size: 12px; color: var(--s400); }
+.mode.active { border-color: var(--brand500); background: rgb(37 99 235 / .15); }
+.subjects { display: grid; gap: 6px; max-height: 340px; overflow-y: auto; overflow-x: hidden; padding-right: 4px; }
+.subj-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) minmax(0, 190px) 32px; gap: 6px; align-items: center; }

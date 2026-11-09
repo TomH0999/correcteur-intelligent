@@ -102,12 +102,17 @@ class Settings {
   }
 
   update(prefs) {
-    const allowed = ['provider', 'correctionModel', 'visionModel', 'audioModel', 'maxInputChars', 'gradeMax', 'level', 'severity', 'reasoningEffort', 'speedMode', 'preread', 'pdfMode', 'executeCode', 'autoFlashcards', 'ollamaUrl'];
+    const allowed = ['provider', 'correctionModel', 'visionModel', 'audioModel', 'maxInputChars', 'gradeMax', 'level', 'severity', 'reasoningEffort', 'speedMode', 'preread', 'claudeMode', 'claudeProjectUrl', 'claudeReadable', 'subjects', 'negatif', 'pdfMode', 'executeCode', 'autoFlashcards', 'ollamaUrl'];
     const clean = {};
     for (const k of allowed) if (prefs[k] !== undefined) clean[k] = prefs[k];
     if (clean.provider && !PROVIDERS[clean.provider]) delete clean.provider;
     if (clean.speedMode && !['rapide', 'equilibre', 'approfondi'].includes(clean.speedMode)) delete clean.speedMode;
     if (clean.preread !== undefined) clean.preread = !!clean.preread;
+    if (clean.claudeMode && !['direct', 'project'].includes(clean.claudeMode)) delete clean.claudeMode;
+    if (clean.claudeProjectUrl !== undefined && clean.claudeProjectUrl && !/^https:\/\/claude\.ai\//.test(clean.claudeProjectUrl)) throw new Error('Le lien du projet doit commencer par https://claude.ai/');
+    if (clean.subjects !== undefined) {
+      clean.subjects = (Array.isArray(clean.subjects) ? clean.subjects : []).map((x) => ({ id: String(x.id || '').trim().slice(0, 20), label: String(x.label || '').trim().slice(0, 80), family: String(x.family || 'autre') })).filter((x) => x.id && x.label).slice(0, 80);
+    }
     if (clean.maxInputChars) clean.maxInputChars = Math.max(4000, Math.min(800000, Number(clean.maxInputChars) || DEFAULTS.maxInputChars));
     if (clean.gradeMax) clean.gradeMax = Math.max(1, Math.min(1000, Number(clean.gradeMax) || 20));
     this.data.prefs = { ...this.data.prefs, ...clean };

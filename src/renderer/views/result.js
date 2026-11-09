@@ -27,6 +27,9 @@ const execTone = (e) => (e.internal && !e.ok ? 'na' : e.unavailable ? 'na' : e.o
 
 function render(root, rec) {
   const r = rec.result;
+  // Fonctions qui demandent une clé API (sinon : équivalents dans Claude)
+  const withApi = !!state.settings?.hasApiKey;
+  const isClaude = rec.origin === 'claude';
   const folderName = state.folders.find((f) => f.id === rec.folder_id)?.name;
   const n = (s) => r.questions.filter((q) => q.statut === s).length;
   const ex = r.executions || [];
@@ -36,12 +39,13 @@ function render(root, rec) {
       <div class="spacer"></div>
       <button class="btn sm" id="r-folder"><i class="fa-solid fa-folder${folderName ? '' : '-plus'}" style="color:var(--amber)"></i>${folderName ? esc(folderName) : 'Enregistrer dans un dossier'}</button>
       <button class="btn sm" id="r-rename"><i class="fa-solid fa-pen"></i>Renommer</button>
-      <button class="btn sm" id="r-annot"><i class="fa-solid fa-highlighter"></i>Copie annotée</button>
-      <button class="btn sm" id="r-chat"><i class="fa-solid fa-comments"></i>Discuter</button>
-      <button class="btn sm" id="r-train"><i class="fa-solid fa-dumbbell"></i>S'entraîner</button>
+      ${rec.claude_url ? '<button class="btn sm primary" id="r-claude"><i class="fa-solid fa-arrow-up-right-from-square"></i>Ouvrir dans Claude</button>' : ''}
+      ${withApi && rec.pages?.length ? '<button class="btn sm" id="r-annot"><i class="fa-solid fa-highlighter"></i>Copie annotée</button>' : ''}
+      ${withApi ? '<button class="btn sm" id="r-chat"><i class="fa-solid fa-comments"></i>Discuter</button>' : ''}
+      ${withApi ? '<button class="btn sm" id="r-train"><i class="fa-solid fa-dumbbell"></i>S\'entraîner</button>' : ''}
       <button class="btn sm" id="r-cards"><i class="fa-solid fa-layer-group"></i>Fiches</button>
       <button class="btn sm" id="r-compare"><i class="fa-solid fa-code-compare"></i>Comparer</button>
-      <button class="btn sm" id="r-rerun" title="Relancer la correction sur les mêmes documents"><i class="fa-solid fa-rotate"></i>Re-corriger</button>
+      ${withApi && !isClaude && rec.sources?.length ? '<button class="btn sm" id="r-rerun" title="Relancer la correction sur les mêmes documents"><i class="fa-solid fa-rotate"></i>Re-corriger</button>' : ''}
       <button class="btn sm" id="r-md" title="Exporter en Markdown"><i class="fa-solid fa-file-arrow-down"></i>.md</button>
       <button class="btn sm" id="r-pdf" title="Exporter en PDF"><i class="fa-solid fa-file-pdf"></i></button>
       <button class="btn sm danger" id="r-del" title="Supprimer"><i class="fa-solid fa-trash-can"></i></button>
@@ -74,16 +78,34 @@ function render(root, rec) {
     </div>
 
     <div id="r-attempts" class="no-print"></div>
+    <section class="card no-print claude-next">
+      <div class="row between wrap">
+        <h2 style="margin:0"><i class="fa-solid fa-wand-magic-sparkles"></i>Continuer avec Claude</h2>
+        <span class="xs dim">Le prompt est copié : colle-le dans Claude${rec.claude_url ? ' (dans la même conversation pour garder le contexte)' : ''}.</span>
+      </div>
+      <div class="row wrap" style="gap:8px;margin-top:10px">
+        <button class="btn sm" data-follow="explain"><i class="fa-solid fa-chalkboard-user"></i>Réexpliquer mes erreurs</button>
+        <button class="btn sm" data-follow="similar"><i class="fa-solid fa-dumbbell"></i>Exercice similaire</button>
+        <button class="btn sm" data-follow="flash"><i class="fa-solid fa-bolt"></i>Questions flash</button>
+        <button class="btn sm" id="r-redo"><i class="fa-solid fa-rotate"></i>Nouvelle tentative</button>
+        <button class="btn sm ghost" id="r-link"><i class="fa-solid fa-link"></i>${rec.claude_url ? 'Changer le lien' : 'Ajouter le lien de la conversation'}</button>
+      </div>
+      <div class="row wrap" style="gap:6px;margin-top:10px">
+        ${(rec.attachments || []).map((a, i) => `<button class="chip" data-att="${i}" title="Ouvrir"><i class="fa-solid fa-paperclip"></i>${esc(a.name)}</button>`).join('')}
+        <button class="btn sm ghost" id="r-att-add"><i class="fa-solid fa-plus"></i>Joindre un fichier</button>
+      </div>
+    </section>
     <nav class="tabs no-print">
       <a href="#sec-synthese">Synthèse</a><a href="#sec-questions">Questions</a><a href="#sec-fautes">Fautes (${r.fautes.length})</a>
       ${ex.length ? '<a href="#sec-exec">Exécution du code</a>' : ''}
-      <a href="#sec-ameliorations">Améliorations</a><a href="#sec-revoir">À revoir</a><a href="#sec-modele">Correction modèle</a><a href="#sec-chat">Discuter avec l'IA</a><a href="#sec-sources">Documents lus</a>
+      <a href="#sec-ameliorations">Améliorations</a><a href="#sec-revoir">À revoir</a><a href="#sec-modele">${isClaude ? 'Solutions' : 'Correction modèle'}</a>${withApi ? '<a href="#sec-chat">Discuter avec l\'IA</a>' : ''}${rec.sources?.length ? '<a href="#sec-sources">Documents lus</a>' : ''}
     </nav>
 
     <section class="card" id="sec-synthese">
       <h2><i class="fa-solid fa-clipboard-check"></i>Synthèse</h2>
       <div class="md" data-md="resume"></div>
       ${r.points_forts.length ? `<h3>Points forts</h3><ul style="padding-left:0;list-style:none;margin:0">${r.points_forts.map((p) => `<li class="md-inline" style="margin:4px 0"><i class="fa-solid fa-check" style="color:var(--emerald);margin-right:8px"></i>${mdToHtml(p, { inline: true })}</li>`).join('')}</ul>` : ''}
+      ${isClaude ? '' : `
       <h3>Identification automatique des documents</h3>
       <div class="card-inner" style="display:grid;gap:4px">
         <div><i class="fa-solid fa-clipboard-list" style="color:var(--brand400);width:18px"></i> <strong>Énoncé :</strong> ${r.identification.enonce.length ? r.identification.enonce.map(esc).join(', ') : (r.identification.enonce_present ? '—' : '<em>absent — questions déduites de tes réponses</em>')}</div>
@@ -91,6 +113,7 @@ function render(root, rec) {
         ${r.identification.bareme?.length ? `<div><i class="fa-solid fa-scale-balanced" style="color:var(--amber);width:18px"></i> <strong>Barème / corrigé :</strong> ${r.identification.bareme.map(esc).join(', ')}</div>` : ''}
         ${r.identification.remarques ? `<div class="small muted">${esc(r.identification.remarques)}</div>` : ''}
       </div>
+      `}
     </section>
 
     <section class="card" id="sec-questions">
@@ -104,6 +127,7 @@ function render(root, rec) {
             <span class="q-pts" style="color:${scoreColor(q.points_max ? (q.points_obtenus / q.points_max) * 100 : null)}">${fr(q.points_obtenus)} / ${fr(q.points_max)}</span>
           </div>
           <div class="md q-body" data-md="q:${i}"></div>
+          ${r.solutions?.[q.numero] ? `<details class="sol"><summary><i class="fa-solid fa-key"></i> Solution</summary><div class="md" data-md="sol:${i}"></div></details>` : ''}
         </div>`).join('') : '<p class="muted">Pas de détail par question.</p>'}
     </section>
 
@@ -160,10 +184,10 @@ function render(root, rec) {
 
     <section class="card" id="sec-modele">
       <h2><i class="fa-solid fa-graduation-cap"></i>Correction modèle</h2>
-      <div id="modele-box">${r.correction_modele === undefined ? `<div class="model-wait">${pendingModel(rec) ? '<div class="spinner sm"></div><span>Rédaction de la correction modèle en arrière-plan… (ta note est déjà définitive)</span>' : '<span>Correction modèle non rédigée.</span><button class="btn sm" id="r-model"><i class="fa-solid fa-pen-nib"></i>La rédiger</button>'}</div>` : '<div class="md" data-md="modele"></div>'}</div>
+      <div id="modele-box">${r.correction_modele === undefined && isClaude ? '<p class="muted">Toutes tes réponses sont justes : aucune solution à reprendre. 🎉</p>' : r.correction_modele === undefined ? `<div class="model-wait">${pendingModel(rec) ? '<div class="spinner sm"></div><span>Rédaction de la correction modèle en arrière-plan… (ta note est déjà définitive)</span>' : (withApi ? '<span>Correction modèle non rédigée.</span><button class="btn sm" id="r-model"><i class="fa-solid fa-pen-nib"></i>La rédiger</button>' : '<span>Pas de correction modèle.</span>')}</div>` : '<div class="md" data-md="modele"></div>'}</div>
     </section>
 
-    <section class="card no-print" id="sec-chat">
+    ${withApi ? '' : '<template>'}<section class="card no-print" id="sec-chat">
       <div class="row between"><h2 style="margin:0"><i class="fa-solid fa-comments"></i>Discuter avec l'IA de cette correction</h2><button class="btn sm ghost" id="chat-clear"><i class="fa-solid fa-eraser"></i>Effacer</button></div>
       <p class="small muted">Pose tes questions : l'IA connaît ta copie, la correction et les résultats des tests.</p>
       <div class="chat-log" id="chat-log"></div>
@@ -174,11 +198,11 @@ function render(root, rec) {
         <textarea id="chat-text" rows="2" placeholder="Ta question… (Entrée pour envoyer, Maj+Entrée pour aller à la ligne)"></textarea>
         <button class="btn primary" id="chat-send"><i class="fa-solid fa-paper-plane"></i></button>
       </div>
-    </section>
+    </section>${withApi ? '' : '</template>'}
 
     <section class="card no-print" id="sec-sources">
-      <h2><i class="fa-solid fa-eye"></i>Documents lus par l'IA</h2>
-      <p class="small muted" style="margin-top:-6px">Texte extrait et transcription des images : vérifie qu'un manuscrit a bien été déchiffré.</p>
+      <h2><i class="fa-solid fa-${rec.sources?.length ? 'eye' : 'circle-info'}"></i>${rec.sources?.length ? 'Documents lus par l\'IA' : 'Informations'}</h2>
+      ${rec.sources?.length ? '<p class="small muted" style="margin-top:-6px">Texte extrait et transcription des images : vérifie qu\'un manuscrit a bien été déchiffré.</p>' : ''}
       ${rec.sources.map((s, i) => `<details class="src"><summary>${esc(s.label)} <span class="xs dim">· ${s.kind === 'image' ? 'image transcrite' : s.kind === 'audio' ? 'audio transcrit' : 'texte'} · ${s.text.length.toLocaleString('fr-FR')} car.</span></summary><div class="md" data-md="src:${i}"></div></details>`).join('')}
       ${rec.consigne ? `<p class="small"><strong>Indications données :</strong> ${esc(rec.consigne)}</p>` : ''}
       ${r.timings?.total ? `<p class="xs dim timings"><span><i class="fa-solid fa-stopwatch"></i> Correction en ${secs(r.timings.total)}</span>${(r.timings.etapes || []).filter((t) => t.ms >= 500).map((t) => `<span>${esc(t.etape)} : ${secs(t.ms)}</span>`).join('')}</p>` : ''}
@@ -190,6 +214,7 @@ function render(root, rec) {
     if (k === 'resume') return r.resume;
     if (k === 'modele') return r.correction_modele || '_Pas de correction modèle._';
     if (k === 'q') return r.questions[i].commentaire;
+    if (k === 'sol') return r.solutions?.[r.questions[i].numero] || '';
     if (k === 'f') return r.fautes[i][f];
     if (k === 'a') return r.ameliorations[i].detail;
     if (k === 'rv') return r.a_revoir[i][f];
@@ -240,11 +265,12 @@ function bind(root, rec) {
     await api.update(rec.id, { name });
     go('result', { id: rec.id });
   };
-  $('#r-train', root).onclick = () => go('training', { fromCorrection: rec });
-  $('#r-annot', root).onclick = () => go('annotate', { id: rec.id });
-  $('#r-chat', root).onclick = () => { $('#sec-chat', root).scrollIntoView({ behavior: 'smooth' }); $('#chat-text', root).focus(); };
-  initChat(root, rec);
-  $('#r-cards', root).onclick = async (e) => {
+  ($('#r-train', root) || {}).onclick = () => go('training', { fromCorrection: rec });
+  ($('#r-annot', root) || {}).onclick = () => go('annotate', { id: rec.id });
+  ($('#r-chat', root) || {}).onclick = () => { $('#sec-chat', root).scrollIntoView({ behavior: 'smooth' }); $('#chat-text', root).focus(); };
+  if ($('#chat-log', root)) initChat(root, rec);
+  bindClaude(root, rec);
+  ($('#r-cards', root) || {}).onclick = async (e) => {
     const btn = e.currentTarget;
     const existing = await api.cards({ correctionId: rec.id });
     if (existing.length) return go('cards', { correctionId: rec.id });
@@ -260,7 +286,7 @@ function bind(root, rec) {
     }
   };
   $('#r-compare', root).onclick = () => go('compare', { a: rec.id });
-  $('#r-rerun', root).onclick = async (e) => {
+  ($('#r-rerun', root) || {}).onclick = async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
     btn.innerHTML = '<div class="spinner sm"></div>Correction…';
@@ -445,3 +471,36 @@ register('result', {
     render(root, rec);
   }
 });
+
+// ---------- Continuer avec Claude ----------
+function bindClaude(root, rec) {
+  $('#r-claude', root)?.addEventListener('click', () => api.openExternal(rec.claude_url));
+  $$('[data-follow]', root).forEach((b) => (b.onclick = async () => {
+    let extra = '';
+    if (b.dataset.follow === 'explain') extra = (await promptText('Réexpliquer mes erreurs', '', 'Sur quoi bloques-tu le plus ? (facultatif)', 'fa-chalkboard-user')) || '';
+    const { prompt } = await api.claudeFollowup({ id: rec.id, kind: b.dataset.follow, extra });
+    if (rec.claude_url) {
+      await api.writeClipboard(prompt);
+      api.openExternal(rec.claude_url);
+      toast('Prompt copié : colle-le dans la conversation Claude (Ctrl+V).', 'ok', 6000);
+    } else {
+      const r = await api.claudeOpen({ prompt, newChat: true });
+      toast(r.prefilled ? 'Claude s\'ouvre avec le prompt prérempli.' : 'Prompt copié : colle-le dans Claude (Ctrl+V).', 'ok', 6000);
+    }
+  }));
+  $('#r-redo', root).onclick = () => go('claude');
+  $('#r-link', root).onclick = async () => {
+    const url = await promptText('Lien de la conversation Claude', rec.claude_url || '', 'Copie l\'adresse de la conversation dans Claude (https://claude.ai/chat/…)', 'fa-link');
+    if (url == null) return;
+    if (url && !/^https:\/\/claude\.ai\//.test(url.trim())) return toast('Le lien doit commencer par https://claude.ai/', 'error');
+    await api.update(rec.id, { claudeUrl: url.trim() });
+    go('result', { id: rec.id });
+  };
+  $$('[data-att]', root).forEach((b) => (b.onclick = () => api.openAttachment(rec.id, Number(b.dataset.att)).catch((err) => toast(err.message, 'error'))));
+  $('#r-att-add', root).onclick = async () => {
+    const paths = await api.pickFiles();
+    if (!paths.length) return;
+    await api.addAttachments(rec.id, paths);
+    go('result', { id: rec.id });
+  };
+}

@@ -67,10 +67,40 @@ async function render(root) {
   selectedProvider = selectedProvider || s.provider;
   const prov = s.providers.find((p) => p.id === selectedProvider);
   const upd = await api.updateState();
+  const cat = await api.claudeCatalog();
+  const instr = await api.claudeInstructions();
   root.innerHTML = `
+    <div class="card" id="s-claude">
+      <h2><i class="fa-solid fa-wand-magic-sparkles"></i>Correction avec Claude</h2>
+      <p class="small muted" style="margin-top:-6px">Tes corrections se font dans Claude (claude.ai) avec ton abonnement ; l'application prépare les prompts et enregistre les résultats.</p>
+      <div class="mode-grid">
+        <label class="mode ${s.claudeMode !== 'project' ? 'active' : ''}"><input type="radio" name="s-cmode" value="direct" ${s.claudeMode !== 'project' ? 'checked' : ''} /><b>Prompt complet</b><span>Rien à configurer. Chaque prompt contient toutes les règles (≈ 700 jetons).</span></label>
+        <label class="mode ${s.claudeMode === 'project' ? 'active' : ''}"><input type="radio" name="s-cmode" value="project" ${s.claudeMode === 'project' ? 'checked' : ''} /><b><i class="fa-solid fa-bolt" style="color:var(--amber)"></i> Projet Claude (recommandé)</b><span>Règles collées une seule fois dans un projet : chaque prompt fait ≈ 60 jetons et les corrections restent dans un même endroit.</span></label>
+      </div>
+      <div id="s-proj" class="card-inner ${s.claudeMode === 'project' ? '' : 'hidden'}" style="margin-top:12px">
+        <ol class="howto" style="margin-top:0">
+          <li>Dans Claude : <b>Projets → Créer un projet</b> (ex. « Correcteur BUT »).</li>
+          <li>Ouvre <b>Instructions du projet</b> et colle les instructions : <button class="btn sm" id="s-copy-instr"><i class="fa-regular fa-copy"></i>Copier les instructions</button> <span class="xs dim">≈ ${instr.tokens} jetons, lus une fois par conversation</span></li>
+          <li>Copie l'adresse du projet et colle-la ici : le bouton « Ouvrir Claude » ouvrira directement ce projet.</li>
+        </ol>
+        <div class="field"><label class="label">Lien du projet Claude</label><input id="s-proj-url" placeholder="https://claude.ai/project/…" value="${esc(s.claudeProjectUrl || '')}" /></div>
+        <details class="src"><summary>Voir les instructions</summary><pre class="prompt-pre">${esc(instr.text)}</pre></details>
+      </div>
+      <label class="check" style="margin-top:12px"><input type="checkbox" id="s-readable" ${s.claudeReadable ? 'checked' : ''} /><span>Demander aussi une version lisible dans Claude<small>Plus confortable à lire dans Claude, mais environ 2 fois plus de jetons. Inutile : l'application met en forme la correction.</small></span></label>
+      <h3>Mes matières</h3>
+      <p class="small muted" style="margin-top:0">La famille choisit les vérifications spécifiques (SQL testé sur des données, calculs refaits, code exécuté mentalement…).</p>
+      <div id="s-subjects" class="subjects"></div>
+      <div class="row wrap" style="margin-top:8px">
+        <button class="btn sm" id="s-sub-add"><i class="fa-solid fa-plus"></i>Ajouter une matière</button>
+        <button class="btn sm ghost" id="s-sub-reset"><i class="fa-solid fa-rotate-left"></i>Liste par défaut</button>
+        <span class="spacer"></span>
+        <button class="btn primary" id="s-claude-save"><i class="fa-solid fa-floppy-disk"></i>Enregistrer</button>
+      </div>
+    </div>
+
     <div class="card">
-      <h2><i class="fa-solid fa-robot"></i>Intelligence artificielle</h2>
-      <p class="small muted" style="margin-top:-6px">Choisis le service qui corrige. Groq et Gemini ont une offre gratuite ; Ollama fonctionne hors ligne sur ton PC.</p>
+      <h2><i class="fa-solid fa-robot"></i>Correction automatique par API (facultatif)</h2>
+      <p class="small muted" style="margin-top:-6px">Seulement si tu veux que l'application corrige seule, sans passer par Claude. Une clé API est alors nécessaire (Groq et Gemini ont une offre gratuite ; Ollama fonctionne hors ligne).</p>
       <div class="provider-grid">${s.providers.map((p) => `
         <button class="provider ${p.id === selectedProvider ? 'active' : ''}" data-p="${p.id}">
           <b>${esc(p.label)} ${p.id === s.provider ? '<i class="fa-solid fa-circle-check" style="color:var(--emerald)"></i>' : ''}</b>
@@ -160,6 +190,13 @@ async function render(root) {
       <div class="row" style="margin-top:10px"><button class="btn sm" id="s-open-bk"><i class="fa-solid fa-folder-open"></i>Ouvrir le dossier des sauvegardes</button></div>
     </div>
 
+    <div class="card">
+      <h2><i class="fa-solid fa-file-waveform"></i>Journal des erreurs</h2>
+      <p class="small muted" style="margin-top:-6px">Si quelque chose ne marche pas, le journal indique précisément ce qui s'est passé.</p>
+      <div class="row wrap"><button class="btn sm" id="s-log"><i class="fa-solid fa-eye"></i>Afficher</button><button class="btn sm" id="s-log-copy"><i class="fa-regular fa-copy"></i>Copier</button><button class="btn sm ghost" id="s-log-dir"><i class="fa-solid fa-folder-open"></i>Ouvrir le dossier</button></div>
+      <pre id="s-log-box" class="prompt-pre hidden" style="max-height:300px"></pre>
+    </div>
+
     <div class="card danger-zone">
       <h2><i class="fa-solid fa-triangle-exclamation"></i>Réinitialiser l'application</h2>
       <p class="small muted" style="margin-top:-6px">Efface les données de cette installation. Une sauvegarde automatique est créée juste avant : tu pourras tout récupérer depuis la liste ci-dessus.</p>
@@ -169,6 +206,7 @@ async function render(root) {
   $('#s-pdf', root).value = s.pdfMode;
   $('#s-speed', root).value = s.speedMode || 'equilibre';
   bind(root, s, prov);
+  bindClaude(root, s, cat);
   if (selectedProvider === s.provider) loadModels(root, s.provider);
 }
 
@@ -340,4 +378,63 @@ register('settings', { title: 'Réglages', show: (root) => render(root) });
 
 export function updateStatusText(u) {
   return updateText(u);
+}
+
+// ---------- Réglages Claude ----------
+function bindClaude(root, s, cat) {
+  let subjects = (s.subjects?.length ? s.subjects : cat.subjects).map((x) => ({ ...x }));
+  const fams = Object.entries(cat.families);
+  const draw = () => {
+    $('#s-subjects', root).innerHTML = subjects.map((x, i) => `
+      <div class="subj-row" data-i="${i}">
+        <input class="s-id" value="${esc(x.id)}" placeholder="Code (ex. R1.05)" />
+        <input class="s-label" value="${esc(x.label)}" placeholder="Nom affiché" />
+        <select class="s-fam">${fams.map(([k, v]) => `<option value="${k}" ${k === x.family ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        <button class="icon-btn danger s-del" title="Retirer"><i class="fa-solid fa-xmark"></i></button>
+      </div>`).join('');
+    $$('.subj-row', root).forEach((row) => {
+      const i = Number(row.dataset.i);
+      $('.s-id', row).oninput = (e) => (subjects[i].id = e.target.value);
+      $('.s-label', row).oninput = (e) => (subjects[i].label = e.target.value);
+      $('.s-fam', row).onchange = (e) => (subjects[i].family = e.target.value);
+      $('.s-del', row).onclick = () => { subjects.splice(i, 1); draw(); };
+    });
+  };
+  draw();
+  $$('input[name="s-cmode"]', root).forEach((r) => (r.onchange = () => {
+    $$('.mode', root).forEach((m) => m.classList.toggle('active', $('input', m).checked));
+    $('#s-proj', root).classList.toggle('hidden', r.value !== 'project' || !r.checked);
+  }));
+  $('#s-copy-instr', root).onclick = async () => {
+    const { text } = await api.claudeInstructions();
+    await api.writeClipboard(text);
+    toast('Instructions copiées : colle-les dans « Instructions du projet » de Claude.', 'ok', 6000);
+  };
+  $('#s-sub-add', root).onclick = () => { subjects.push({ id: '', label: '', family: 'autre' }); draw(); };
+  $('#s-sub-reset', root).onclick = () => { subjects = cat.defaultSubjects.map((x) => ({ ...x })); draw(); };
+  $('#s-claude-save', root).onclick = async () => {
+    try {
+      const mode = $('input[name="s-cmode"]:checked', root).value;
+      const url = $('#s-proj-url', root).value.trim();
+      state.settings = await api.saveSettings({
+        claudeMode: mode,
+        claudeProjectUrl: url,
+        claudeReadable: $('#s-readable', root).checked,
+        subjects: subjects.filter((x) => x.id.trim() && x.label.trim())
+      });
+      toast(mode === 'project' && !url ? 'Enregistré. Ajoute le lien du projet pour l\'ouvrir directement.' : 'Réglages Claude enregistrés.', 'ok');
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  };
+  $('#s-log', root).onclick = async () => {
+    const box = $('#s-log-box', root);
+    box.textContent = (await api.appLog()) || 'Aucune erreur enregistrée. 👍';
+    box.classList.remove('hidden');
+  };
+  $('#s-log-copy', root).onclick = async () => {
+    await api.writeClipboard((await api.appLog()) || '');
+    toast('Journal copié.', 'ok');
+  };
+  $('#s-log-dir', root).onclick = () => api.openLogDir();
 }

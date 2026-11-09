@@ -128,6 +128,11 @@ class Database {
     add('corrections', 'counted', 'INTEGER NOT NULL DEFAULT 1');
     add('corrections', 'exercise_key', 'TEXT');
     add('corrections', 'answer_hash', 'TEXT');
+    // v5 : corrections faites dans Claude (lien de la conversation, fichiers joints, type d'évaluation)
+    add('corrections', 'origin', "TEXT DEFAULT 'api'");
+    add('corrections', 'claude_url', 'TEXT');
+    add('corrections', 'attachments', 'TEXT');
+    add('corrections', 'eval_type', 'TEXT');
     this.x(`
       CREATE TABLE IF NOT EXISTS chat_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,14 +288,15 @@ class Database {
     const r = rec.result || {};
     const fp = Database.fingerprints({ result: r, sources: rec.sources || [], exerciseUuid: rec.exerciseUuid });
     return this.run(
-      `INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, exercise_id, pages, counted, exercise_key, answer_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, exercise_id, pages, counted, exercise_key, answer_hash, origin, claude_url, attachments, eval_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         rec.uuid || uuid(), rec.name, rec.folderId || null, rec.createdAt || now(), now(), r.matiere || null, r.type_exercice || null,
         r.score_pourcentage ?? null, r.note?.obtenue ?? null, r.note?.sur ?? null,
         JSON.stringify(rec.files || []), rec.consigne || '', JSON.stringify(r), JSON.stringify(rec.sources || []), rec.model || null,
         Database.searchText(rec, r), rec.kind || 'correction', rec.exerciseId || null, rec.pages ? JSON.stringify(rec.pages) : null,
-        rec.counted === false ? 0 : 1, rec.exerciseKey || fp.exerciseKey, fp.answerHash
+        rec.counted === false ? 0 : 1, rec.exerciseKey || fp.exerciseKey, rec.answerHash || fp.answerHash,
+        rec.origin || 'api', rec.claudeUrl || null, rec.attachments ? JSON.stringify(rec.attachments) : null, rec.evalType || null
       ]
     );
   }
@@ -303,7 +309,8 @@ class Database {
       result: row.result ? JSON.parse(row.result) : null,
       sources: row.sources ? JSON.parse(row.sources) : [],
       pages: row.pages ? JSON.parse(row.pages) : [],
-      annotations: row.annotations ? JSON.parse(row.annotations) : []
+      annotations: row.annotations ? JSON.parse(row.annotations) : [],
+      attachments: row.attachments ? JSON.parse(row.attachments) : []
     };
   }
 
@@ -320,6 +327,7 @@ class Database {
     if (q.type) { where.push('exercise_type = ?'); params.push(q.type); }
     if (q.kind) { where.push("COALESCE(kind, 'correction') = ?"); params.push(q.kind); }
     if (q.subject) { where.push('subject = ?'); params.push(q.subject); }
+    if (q.evalType) { where.push('eval_type = ?'); params.push(q.evalType); }
     // Brouillons : exclus par défaut (non comptés)
     if (q.drafts) where.push('counted = 0');
     else if (!q.all) where.push('counted = 1');
@@ -329,7 +337,7 @@ class Database {
         params.push(`%${word.replace(/[\\%_]/g, (m) => '\\' + m)}%`);
       }
     }
-    const sql = `SELECT c.id, c.uuid, c.name, c.folder_id, c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.model, c.kind, c.counted, c.exercise_key,
+    const sql = `SELECT c.id, c.uuid, c.name, c.folder_id, c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.model, c.kind, c.counted, c.exercise_key, c.origin, c.eval_type,
                         f.name AS folder_name
                  FROM corrections c LEFT JOIN folders f ON f.id = c.folder_id
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
@@ -347,6 +355,8 @@ class Database {
       this.x('UPDATE corrections SET name = ?, search_text = ? WHERE id = ?', [clean, Database.searchText({ ...row, name: clean }, row.result), id]);
     }
     if (patch.folderId !== undefined) this.x('UPDATE corrections SET folder_id = ? WHERE id = ?', [patch.folderId || null, id]);
+    if (patch.claudeUrl !== undefined) this.x('UPDATE corrections SET claude_url = ? WHERE id = ?', [patch.claudeUrl || null, id]);
+    if (patch.attachments !== undefined) this.x('UPDATE corrections SET attachments = ? WHERE id = ?', [JSON.stringify(patch.attachments || []), id]);
     if (patch.counted !== undefined) this.x('UPDATE corrections SET counted = ? WHERE id = ?', [patch.counted ? 1 : 0, id]);
     if (patch.exerciseKey !== undefined) {
       // null = détacher : l'exercice redevient une série à part
@@ -719,14 +729,14 @@ class Database {
       if (local) {
         corrMap[c.id] = local.id;
         if (newer(c.updated_at, local.updated_at)) {
-          this.x('UPDATE corrections SET name = ?, folder_id = ?, search_text = ?, counted = ?, exercise_key = COALESCE(?, exercise_key), updated_at = ? WHERE id = ?', [c.name, folderId, c.search_text, c.counted ?? 1, c.exercise_key ?? null, c.updated_at, local.id]);
+          this.x('UPDATE corrections SET name = ?, folder_id = ?, search_text = ?, counted = ?, exercise_key = COALESCE(?, exercise_key), claude_url = COALESCE(?, claude_url), result = COALESCE(?, result), updated_at = ? WHERE id = ?', [c.name, folderId, c.search_text, c.counted ?? 1, c.exercise_key ?? null, c.claude_url ?? null, c.result ?? null, c.updated_at, local.id]);
           stats.updated++;
         }
         continue;
       }
-      this.x(`INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, pages, annotations, counted, exercise_key, answer_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.uuid || uuid(), c.name, folderId, c.created_at, c.updated_at || c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.consigne, c.result, c.sources, c.model, c.search_text, c.kind || 'correction', c.pages, c.annotations, c.counted ?? 1, c.exercise_key ?? null, c.answer_hash ?? null]);
+      this.x(`INSERT INTO corrections (uuid, name, folder_id, created_at, updated_at, subject, exercise_type, score, grade, grade_max, files, consigne, result, sources, model, search_text, kind, pages, annotations, counted, exercise_key, answer_hash, origin, claude_url, attachments, eval_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [c.uuid || uuid(), c.name, folderId, c.created_at, c.updated_at || c.created_at, c.subject, c.exercise_type, c.score, c.grade, c.grade_max, c.files, c.consigne, c.result, c.sources, c.model, c.search_text, c.kind || 'correction', c.pages, c.annotations, c.counted ?? 1, c.exercise_key ?? null, c.answer_hash ?? null, c.origin || 'api', c.claude_url ?? null, c.attachments ?? null, c.eval_type ?? null]);
       corrMap[c.id] = this.get('SELECT last_insert_rowid() AS id').id;
       stats.corrections++;
     }

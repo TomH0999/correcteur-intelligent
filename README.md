@@ -4,19 +4,30 @@ Application Windows de **correction automatique d'exercices par IA**, pensée po
 maths manuscrites, code (tous langages), bases de données (MCD/MLD, SQL), réseaux, systèmes, UML, etc.
 Le style reprend celui du [Gestionnaire de notes](https://github.com/TomH0999/gestionnaire_de_notes).
 
-Tu importes l'énoncé, tes réponses (et éventuellement le barème du prof) — en un ou plusieurs fichiers,
-dans n'importe quel format — et l'application :
+## 🪄 Corriger avec Claude (mode principal)
 
-1. **convertit tout en texte** lisible par l'IA : lecture des manuscrits et schémas par un modèle de vision
-   (testé automatiquement), OCR local de secours, transcription audio… ;
-2. **détermine elle-même** ce qui est l'énoncé, ta copie et le barème ;
-3. **exécute réellement ton code** (Python, JavaScript, SQL intégrés ; Java, C, C++, PHP si installés) avec des tests
-   préparés par l'IA pendant la correction ;
-4. renvoie une **note** et un **score**, le **détail par question**, un **rapport de fautes**, des **améliorations**,
-   les **notions à revoir** et une **correction modèle** (LaTeX et code mis en forme) ;
-5. **enregistre** chaque correction dans l'historique (base SQLite locale) avec un nom précis et recherchable,
-   par ex. `[BDD] — R1.05 Bases de données — TD3 jointures — 14,5/20 — 2026-11-07 18h42`, et te laisse la classer
-   dans des **dossiers / sous-dossiers**.
+Tu corriges tes contrôles **directement dans Claude** (claude.ai, avec ton abonnement) ; l'application prépare
+le prompt et garde tout dans ta base locale :
+
+1. **Choisis le cas** : contrôle / DS, contrôle blanc, exercice / TD, interro, QCM (points négatifs possibles),
+   TP / code, projet / SAÉ, ou corrigé d'un sujet sans copie, puis la **matière** (ressources du BUT, modifiables).
+   Chaque matière ajoute ses propres vérifications : requêtes SQL testées sur un jeu de données, calculs refaits,
+   code exécuté mentalement sur des cas limites, sous-réseaux recalculés…
+2. **« Copier le prompt et ouvrir Claude »** : Claude s'ouvre avec le prompt prérempli (et copié). Joins l'énoncé et
+   ta copie (PDF, photos, code…) puis envoie.
+3. **Copie la réponse de Claude** et reviens dans l'application : elle est **détectée automatiquement**. Vérifie
+   l'aperçu (note, questions, fautes) puis enregistre. Tu peux ajouter le lien de la conversation et joindre tes fichiers.
+
+Ensuite, depuis chaque correction : **réexpliquer mes erreurs**, **exercice similaire**, **questions flash**,
+**nouvelle tentative** (la progression entre tentatives est mesurée), **ouvrir la conversation Claude**. La page
+Exercices prépare un entraînement ou un contrôle blanc ciblé sur tes notions les plus souvent ratées.
+
+**Peu de jetons, sans perdre en qualité** : Claude répond par un seul bloc JSON compact (commentaires vides quand c'est
+juste, solution seulement pour les questions ratées) et l'application se charge de la mise en forme. La note est
+recalculée à partir des points de chaque question. Avec le **mode Projet Claude** (Réglages → Claude), les règles sont
+collées une seule fois dans les instructions d'un projet : chaque prompt fait alors environ 60 jetons au lieu de 700.
+
+La correction automatique par API (Groq, Gemini, Anthropic, OpenAI, Ollama) reste disponible si tu enregistres une clé.
 
 ## ✨ Fonctionnalités
 

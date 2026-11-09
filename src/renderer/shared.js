@@ -9,7 +9,7 @@ export async function refreshStats() {
     badge.textContent = s.due;
     badge.classList.toggle('hidden', !s.due);
     const prov = state.settings?.providers?.find((p) => p.id === state.settings.provider);
-    $('#side-ai').textContent = `IA : ${prov ? prov.label : '—'}`;
+    $('#side-ai').textContent = state.settings?.hasApiKey && prov ? `Claude · API ${prov.label}` : 'Correction avec Claude';
     return s;
   } catch {
     return null;

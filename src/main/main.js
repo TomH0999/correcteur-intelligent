@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu, Notification, clipboard } = require('electron');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
@@ -14,6 +14,23 @@ const { Database } = require('./db');
 const { Settings } = require('./settings');
 const { correct, recorrect, buildName, generateFlashcards, generateExercise, chatAbout, locateFaultsOnImage, generateModelAnswer, prereadImages } = require('./corrector');
 const { VisionCache } = require('./visioncache');
+const claude = require('./claude');
+
+// ---- Journal des erreurs (pour comprendre un problème : Réglages → Journal) ----
+let logFile = null;
+function logError(where, err) {
+  const line = `[${new Date().toISOString()}] ${where} : ${err?.stack || err?.message || err}\n`;
+  console.error(line);
+  try {
+    if (logFile) {
+      fs.mkdirSync(path.dirname(logFile), { recursive: true });
+      if (fs.existsSync(logFile) && fs.statSync(logFile).size > 2e6) fs.renameSync(logFile, `${logFile}.old`);
+      fs.appendFileSync(logFile, line);
+    }
+  } catch { /* ignore */ }
+}
+process.on('uncaughtException', (err) => logError('Erreur non gérée', err));
+process.on('unhandledRejection', (err) => logError('Promesse rejetée', err));
 const pages = require('./pages');
 const { Queue } = require('./queue');
 const { createProvider, PROVIDERS } = require('./providers');
@@ -74,7 +91,7 @@ function handle(channel, fn) {
     try {
       return await fn(...args);
     } catch (err) {
-      console.error(`[${channel}]`, err);
+      logError(channel, err);
       return { __error: err.message || String(err) };
     }
   });
@@ -120,7 +137,9 @@ async function buildContext({ needVision = false, needAudio = false, progress = 
 let visionCache = null;
 
 async function warmup() {
-  if (settings.public().hasApiKey) {
+  // Correction avec Claude uniquement : rien à préchauffer (pas de moteur d'exécution ni de modèle)
+  if (!settings.public().hasApiKey) return;
+  {
     const ctx = await buildContext({ needVision: true }).catch(() => null);
     if (ctx) console.log('Préchauffage : modèles', ctx.models.main, ctx.models.fast || '-', ctx.models.vision || '-');
   }
@@ -365,6 +384,117 @@ function registerIpc() {
   handle('db:deleteFolder', (id) => db.deleteFolder(id));
   handle('db:list', (q) => db.listCorrections(q || {}));
   handle('db:get', (id) => db.getCorrection(id));
+
+  // ---- Correction avec Claude (claude.ai) ----
+  const subjects = () => (Array.isArray(settings.prefs.subjects) && settings.prefs.subjects.length ? settings.prefs.subjects : claude.DEFAULT_SUBJECTS);
+  const promptOpts = (o = {}) => ({
+    subjects: subjects(), gradeMax: settings.prefs.gradeMax, severity: settings.prefs.severity, level: settings.prefs.level,
+    project: settings.prefs.claudeMode === 'project', readable: !!settings.prefs.claudeReadable, ...o
+  });
+  handle('claude:catalog', () => ({
+    types: claude.TYPES.map(({ rule, ...t }) => t),
+    families: Object.fromEntries(Object.entries(claude.FAMILIES).map(([k, v]) => [k, v.label])),
+    subjects: subjects(),
+    defaultSubjects: claude.DEFAULT_SUBJECTS
+  }));
+  handle('claude:prompt', (o) => {
+    const prompt = claude.buildPrompt(promptOpts(o));
+    return { prompt, tokens: claude.estimateTokens(prompt) };
+  });
+  handle('claude:instructions', () => {
+    const text = claude.projectInstructions(promptOpts());
+    return { text, tokens: claude.estimateTokens(text) };
+  });
+  handle('claude:open', ({ prompt = '', newChat = false } = {}) => {
+    if (prompt) clipboard.writeText(prompt);
+    const url = claude.claudeUrl(prompt, { projectUrl: newChat ? '' : settings.prefs.claudeMode === 'project' ? settings.prefs.claudeProjectUrl : '' });
+    shell.openExternal(url);
+    return { url, prefilled: url.includes('?q=') };
+  });
+  handle('clipboard:read', () => clipboard.readText());
+  handle('clipboard:write', (text) => clipboard.writeText(String(text || '')));
+  handle('claude:looksLike', (text) => claude.looksLikeResult(text));
+  handle('claude:parse', (text, meta = {}) => {
+    const out = claude.parseClaudeResult(text, { gradeMax: settings.prefs.gradeMax, typeId: meta.typeId, subjects: subjects(), matiere: meta.matiere });
+    return { ...out, name: buildName(out.result) };
+  });
+  handle('claude:save', async ({ text, meta = {}, attachments = [] }) => {
+    const { result, flashcards, warnings, annale } = claude.parseClaudeResult(text, { gradeMax: settings.prefs.gradeMax, typeId: meta.typeId, subjects: subjects(), matiere: meta.matiere });
+    if (meta.titre) result.titre = String(meta.titre);
+    const subj = subjects().find((x) => x.id === meta.matiere);
+    if (subj && !result.matiere) result.matiere = subj.label;
+    const uuid = crypto.randomUUID();
+    const saved = [];
+    for (const p of attachments) {
+      try {
+        const name = path.basename(p).replace(/[^\w.\- ()àâäéèêëïîôöùûüç]/gi, '_');
+        const rel = `attachments/${uuid}/${name}`;
+        fs.mkdirSync(path.join(dataDir, 'attachments', uuid), { recursive: true });
+        fs.copyFileSync(p, path.join(dataDir, rel));
+        saved.push({ name, path: rel, size: fs.statSync(p).size });
+      } catch (err) {
+        warnings.push(`Fichier « ${path.basename(p)} » non joint : ${err.message}`);
+      }
+    }
+    // Un corrigé de sujet (sans copie) ne compte pas dans les statistiques
+    const counted = meta.counted !== false && !annale;
+    const id = db.saveCorrection({
+      uuid, counted, name: (meta.name && String(meta.name).trim()) || buildName(result), createdAt: new Date().toISOString(),
+      folderId: meta.folderId || null, result, files: saved.map((a) => ({ name: a.name, role: 'auto' })), consigne: meta.consigne || '',
+      sources: [], model: 'Claude (claude.ai)', kind: annale ? 'corrige' : 'correction', origin: 'claude', claudeUrl: meta.claudeUrl || null,
+      attachments: saved, evalType: meta.typeId || null, exerciseKey: meta.exerciseKey || null,
+      answerHash: crypto.createHash('sha1').update(String(text)).digest('hex')
+    });
+    if (flashcards.length && settings.prefs.autoFlashcards !== false) {
+      db.addFlashcards(flashcards, { correctionId: id, subject: result.matiere });
+      send('cards:added', { correctionId: id, count: flashcards.length });
+    }
+    return { id, warnings };
+  });
+  handle('claude:followup', ({ id, kind, extra = '' }) => {
+    const rec = db.getCorrection(id);
+    if (!rec) throw new Error('Correction introuvable.');
+    const prompt = claude.followUpPrompt(kind, rec, extra);
+    return { prompt, tokens: claude.estimateTokens(prompt) };
+  });
+  handle('claude:training', ({ matiere = '', type = 'exo' } = {}) => {
+    const d = db.dashboard();
+    const subj = subjects().find((x) => x.id === matiere);
+    const notions = d.topNotions.filter((n) => !subj || n.subjects.some((x) => x === subj.label || String(x).startsWith(subj.id)));
+    const prompt = claude.trainingPrompt({ notions: notions.length ? notions : d.topNotions, matiere: subj?.label || '', level: settings.prefs.level, type });
+    return { prompt, tokens: claude.estimateTokens(prompt) };
+  });
+  handle('attachments:open', (id, index) => {
+    const rec = db.getCorrection(id);
+    const a = rec?.attachments?.[index];
+    if (!a) throw new Error('Fichier introuvable.');
+    const full = path.join(dataDir, a.path);
+    if (!full.startsWith(path.join(dataDir, 'attachments'))) throw new Error('Chemin invalide.');
+    return shell.openPath(full);
+  });
+  handle('attachments:add', (id, paths = []) => {
+    const rec = db.getCorrection(id);
+    if (!rec) throw new Error('Correction introuvable.');
+    const list = [...(rec.attachments || [])];
+    for (const p of paths) {
+      const name = path.basename(p).replace(/[^\w.\- ()àâäéèêëïîôöùûüç]/gi, '_');
+      const rel = `attachments/${rec.uuid}/${name}`;
+      fs.mkdirSync(path.join(dataDir, 'attachments', rec.uuid), { recursive: true });
+      fs.copyFileSync(p, path.join(dataDir, rel));
+      list.push({ name, path: rel, size: fs.statSync(p).size });
+    }
+    db.updateCorrection(id, { attachments: list });
+    return list;
+  });
+  handle('app:log', () => {
+    try {
+      return fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').slice(-20000) : '';
+    } catch {
+      return '';
+    }
+  });
+  handle('app:logRenderer', (msg) => logError('Interface', String(msg).slice(0, 4000)));
+  handle('app:openLogDir', () => shell.openPath(path.dirname(logFile)));
   handle('db:update', (id, patch) => db.updateCorrection(id, patch));
   handle('db:delete', (id) => {
     const rec = db.getCorrection(id);
@@ -476,6 +606,7 @@ function registerIpc() {
       for (const f of db.listJobs()) queue.remove(f.id);
       db.resetAll();
       fs.rmSync(path.join(dataDir, 'pages'), { recursive: true, force: true });
+      fs.rmSync(path.join(dataDir, 'attachments'), { recursive: true, force: true });
       queue.setPaused(false);
     }
     settings.reset({ prefs, keys });
@@ -544,6 +675,7 @@ if (!gotLock) {
   if (process.platform === 'win32') app.setAppUserModelId('fr.tomh0999.correcteur-intelligent');
   app.whenReady().then(async () => {
     dataDir = app.getPath('userData');
+    logFile = path.join(dataDir, 'logs', 'app.log');
     runner.setDataDir(dataDir);
     visionCache = new VisionCache(path.join(dataDir, 'cache', 'vision'));
     settings = new Settings(path.join(dataDir, 'settings.json'), safeStorage);
@@ -553,20 +685,32 @@ if (!gotLock) {
     registerIpc();
     if (app.isPackaged) Menu.setApplicationMenu(null);
     createWindow();
-    updater.init({
+    const safe = (label, fn) => {
+      try {
+        return fn();
+      } catch (err) {
+        logError(`Démarrage (${label})`, err);
+        return null;
+      }
+    };
+    safe('mises à jour', () => updater.init({
       notify: (s) => send('update:status', s),
       enabled: settings.public().autoUpdate,
       onBeforeInstall: () => backup.autoBackup(db, settings, app.getVersion(), dataDir, 'avant-mise-a-jour')
-    });
+    }));
     // Sauvegarde automatique quotidienne (protège les données en cas de problème)
     const today = new Date().toISOString().slice(0, 10);
-    if (settings.get('lastAutoBackup') !== today && db.stats().total) {
-      backup.autoBackup(db, settings, app.getVersion(), dataDir, 'quotidienne').then(() => settings.set('lastAutoBackup', today)).catch((err) => console.warn('Sauvegarde auto :', err.message));
-    }
+    safe('sauvegarde quotidienne', () => {
+      if (settings.get('lastAutoBackup') !== today && db.stats().total) {
+        backup.autoBackup(db, settings, app.getVersion(), dataDir, 'quotidienne').then(() => settings.set('lastAutoBackup', today)).catch((err) => logError('Sauvegarde auto', err));
+      }
+    });
     // Brouillons de plus de 14 jours supprimés
-    for (const dir of db.purgeDrafts(14)) {
-      if (!db.get('SELECT id FROM corrections WHERE pages LIKE ?', [`%pages/${dir}/%`])) pages.deletePages(dataDir, dir);
-    }
+    safe('brouillons', () => {
+      for (const dir of db.purgeDrafts(14)) {
+        if (!db.get('SELECT id FROM corrections WHERE pages LIKE ?', [`%pages/${dir}/%`])) pages.deletePages(dataDir, dir);
+      }
+    });
     // File d'attente : reprise des corrections interrompues
     queue = new Queue({
       db,
@@ -579,7 +723,7 @@ if (!gotLock) {
         if (ev.failed) notifyDesktop('Correction en échec', `${ev.failed.title} : ${ev.failed.error}`);
       }
     });
-    queue.resume();
+    safe('file d\'attente', () => queue.resume());
     // Préchauffage : modèles vérifiés et moteurs Python / SQL chargés pendant que tu ajoutes tes fichiers
     setTimeout(() => warmup().catch(() => {}), 2500);
     // Synchronisation au démarrage (récupère les corrections faites sur les autres PC)
@@ -589,6 +733,9 @@ if (!gotLock) {
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
+  }).catch((err) => {
+    logError('Démarrage', err);
+    dialog.showErrorBox('Correcteur Intelligent', `Démarrage impossible : ${err.message}\n\nJournal : ${logFile || 'indisponible'}`);
   });
 
   app.on('before-quit', () => {

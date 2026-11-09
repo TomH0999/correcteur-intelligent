@@ -24,17 +24,18 @@
       </div>
     </div>
     <nav class="nav" id="nav">
-      <button class="nav-item" data-view="new"><i class="fa-solid fa-wand-magic-sparkles"></i><span>Nouvelle correction</span></button>
+      <button class="nav-item" data-view="claude"><i class="fa-solid fa-wand-magic-sparkles"></i><span>Corriger avec Claude</span></button>
       <button class="nav-item" data-view="dashboard"><i class="fa-solid fa-chart-line"></i><span>Progression</span></button>
       <div class="nav-sep">Mes corrections</div>
       <button class="nav-item" data-view="history"><i class="fa-solid fa-clock-rotate-left"></i><span>Historique</span></button>
       <button class="nav-item" data-view="folders"><i class="fa-solid fa-folder-tree"></i><span>Dossiers</span></button>
-      <button class="nav-item" data-view="queue"><i class="fa-solid fa-list-check"></i><span>File d'attente</span><span class="nav-badge hidden" id="queue-badge"></span></button>
       <button class="nav-item" data-view="compare"><i class="fa-solid fa-code-compare"></i><span>Comparer</span></button>
       <div class="nav-sep">S'entraîner</div>
       <button class="nav-item" data-view="cards"><i class="fa-solid fa-layer-group"></i><span>Révisions</span><span class="nav-badge hidden" id="due-badge"></span></button>
       <button class="nav-item" data-view="training"><i class="fa-solid fa-dumbbell"></i><span>Exercices</span></button>
       <div class="nav-sep">Application</div>
+      <button class="nav-item nav-api" data-view="new"><i class="fa-solid fa-robot"></i><span>Correction par API</span></button>
+      <button class="nav-item nav-api" data-view="queue"><i class="fa-solid fa-list-check"></i><span>File d'attente</span><span class="nav-badge hidden" id="queue-badge"></span></button>
       <button class="nav-item" data-view="settings"><i class="fa-solid fa-gear"></i><span>Réglages</span></button>
     </nav>
     <div class="side-foot">
@@ -53,6 +54,7 @@
       </div>
     </header>
     <main id="main">
+      <section class="page" id="page-claude"></section>
       <section class="page" id="page-new"></section>
       <section class="page" id="page-result"></section>
       <section class="page" id="page-dashboard"></section>

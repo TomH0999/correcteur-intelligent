@@ -140,10 +140,22 @@ async function renderTraining(root, params = {}) {
   const from = params.fromCorrection;
   const preNotions = params.notions || (from ? from.result.a_revoir.map((a) => a.notion).concat(from.result.fautes.map((f) => f.notion)).filter(Boolean) : []);
   const uniq = [...new Set(preNotions)].slice(0, 6);
+  const cat = await api.claudeCatalog();
+  const withApi = !!state.settings?.hasApiKey;
   root.innerHTML = `
+    <div class="card claude-next">
+      <h2><i class="fa-solid fa-wand-magic-sparkles"></i>S'entraîner avec Claude sur mes points faibles</h2>
+      <p class="small muted" style="margin-top:-6px">L'application résume tes notions les plus souvent ratées (d'après tes corrections) et prépare la demande pour Claude. Tu fais l'exercice, puis tu le fais corriger dans la même conversation : la correction s'importe comme d'habitude.</p>
+      <div class="grid2">
+        <div class="field"><label class="label">Matière</label><select id="tc-matiere"><option value="">Toutes mes matières</option>${cat.subjects.map((x) => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join('')}</select></div>
+        <div class="field"><label class="label">Format</label><select id="tc-type"><option value="exo">3 exercices progressifs</option><option value="blanc">Contrôle blanc d'1 h</option></select></div>
+      </div>
+      <div class="row" style="margin-top:14px;justify-content:flex-end"><button class="btn primary" id="tc-go"><i class="fa-solid fa-arrow-up-right-from-square"></i>Préparer dans Claude</button></div>
+    </div>
+    ${withApi ? '' : '<template>'}
     <p class="page-intro">Génère des exercices ciblés sur tes points faibles, réponds directement dans l'application (texte, code ou photos), puis fais-les corriger. Tu peux tester ton code avant d'envoyer.</p>
     <div class="card">
-      <h2><i class="fa-solid fa-wand-magic-sparkles"></i>Nouvel exercice</h2>
+      <h2><i class="fa-solid fa-robot"></i>Nouvel exercice (par API)</h2>
       <div class="grid2">
         <div class="field"><label class="label">Notions à travailler (séparées par des virgules)</label><input id="t-notions" value="${esc(uniq.join(', '))}" placeholder="Ex. : jointures SQL, GROUP BY / HAVING" /></div>
         <div class="field"><label class="label">Matière</label><input id="t-matiere" value="${esc(params.matiere || from?.result.matiere || '')}" placeholder="Ex. : R1.05 Bases de données" /></div>
@@ -152,7 +164,7 @@ async function renderTraining(root, params = {}) {
       </div>
       <div class="field" style="margin-top:12px"><label class="label">Demande particulière (facultatif)</label><input id="t-consigne" placeholder="Ex. : en Java, avec des tests unitaires · sur le thème d'une bibliothèque" /></div>
       <div class="row" style="margin-top:16px;justify-content:flex-end"><button class="btn primary" id="t-gen"><i class="fa-solid fa-wand-magic-sparkles"></i>Générer l'exercice</button></div>
-    </div>
+    </div>${withApi ? '' : '</template>'}
     <div class="card" style="margin-top:16px">
       <h2><i class="fa-solid fa-dumbbell"></i>Mes exercices (${list.length})</h2>
       <div class="list">${list.map((e) => `
@@ -163,6 +175,12 @@ async function renderTraining(root, params = {}) {
         </div>`).join('') || emptyState('fa-dumbbell', 'Aucun exercice pour l\'instant.')}</div>
     </div>`;
   $$('.item', root).forEach((el) => (el.onclick = () => go('exercise', { id: Number(el.dataset.id) })));
+  $('#tc-go', root).onclick = async () => {
+    const { prompt } = await api.claudeTraining({ matiere: $('#tc-matiere', root).value, type: $('#tc-type', root).value });
+    const r = await api.claudeOpen({ prompt, newChat: true });
+    toast(r.prefilled ? 'Claude s\'ouvre avec la demande préremplie.' : 'Demande copiée : colle-la dans Claude (Ctrl+V).', 'ok', 6000);
+  };
+  if (!$('#t-gen', root)) return;
   $('#t-gen', root).onclick = async (e) => {
     const notions = $('#t-notions', root).value.split(',').map((s) => s.trim()).filter(Boolean);
     if (!notions.length) return toast('Indique au moins une notion à travailler.', 'warn');

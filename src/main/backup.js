@@ -18,6 +18,13 @@ function addPages(zip, db, dataDir) {
       if (p.img && fs.existsSync(full)) zip.file(p.img, fs.readFileSync(full), { compression: 'STORE' });
     }
   }
+  // Fichiers joints aux corrections faites dans Claude (énoncés, copies)
+  for (const row of db.all('SELECT attachments FROM corrections WHERE attachments IS NOT NULL')) {
+    for (const a of JSON.parse(row.attachments || '[]')) {
+      const full = path.join(dataDir, a.path || '');
+      if (a.path && fs.existsSync(full)) zip.file(a.path.split(path.sep).join('/'), fs.readFileSync(full));
+    }
+  }
 }
 
 async function buildBackup(db, settings, appVersion, { dataDir, withPages = true } = {}) {
@@ -52,7 +59,7 @@ async function importBackup(db, buffer, { mode = 'merge', dataDir } = {}) {
   const b = await readBackup(buffer);
   // Images des pages de copie : restaurées si absentes
   if (b.zip && dataDir) {
-    for (const name of Object.keys(b.zip.files).filter((n) => /^pages\/[\w-]+\/\d+\.jpg$/.test(n))) {
+    for (const name of Object.keys(b.zip.files).filter((n) => /^pages\/[\w-]+\/\d+\.jpg$/.test(n) || (/^attachments\/[\w-]+\/[^/]+$/.test(n) && !n.includes('..')))) {
       const target = path.join(dataDir, name);
       if (fs.existsSync(target)) continue;
       fs.mkdirSync(path.dirname(target), { recursive: true });

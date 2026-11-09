@@ -2,6 +2,7 @@
 import { api, $, $$, toast } from './ui.js';
 import { go, state } from './router.js';
 import { refreshStats } from './shared.js';
+import { checkClipboard } from './views/claude.js';
 import './views/new.js';
 import './views/result.js';
 import './views/lists.js';
@@ -68,9 +69,16 @@ async function init() {
   await refreshStats();
   await initQueue();
   api.onNavResult((id) => go('result', { id }));
-  // Premier lancement : on guide vers la clé API
-  go(state.settings.hasApiKey ? 'new' : 'settings');
-  if (!state.settings.hasApiKey) toast('Bienvenue ! Commence par ajouter une clé API (Groq est gratuit).', 'info', 8000);
+  // Correction avec Claude par défaut ; la correction par API reste disponible si une clé est enregistrée
+  $$('.nav-api').forEach((b) => b.classList.toggle('hidden', !state.settings.hasApiKey));
+  go('claude');
+  // Réponse de Claude copiée : détectée au retour dans l'application
+  window.addEventListener('focus', () => setTimeout(checkClipboard, 150));
+  setTimeout(checkClipboard, 800);
 }
+
+// Erreurs de l'interface enregistrées dans le journal (Réglages → Journal)
+window.addEventListener('error', (e) => api.logRenderer?.(`${e.message} @ ${e.filename}:${e.lineno}`));
+window.addEventListener('unhandledrejection', (e) => api.logRenderer?.(String(e.reason?.stack || e.reason)));
 
 init().catch((err) => toast(err.message, 'error', 10000));
